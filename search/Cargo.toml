@@ -1,0 +1,22 @@
+[package]
+name = "golem-search"
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+homepage = "https://golem.cloud"
+repository = "https://github.com/golemcloud/golem-search"
+description = "WebAssembly components for unified search interfaces, with special support for Golem Cloud"
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+[dependencies]
+golem-rust = { workspace = true }
+wit-bindgen = { version = "0.41.0" }
+log = { workspace = true }
+wasi-logger = "0.1.2"
+
+[features]
+default = ["durability"]
+durability = ["golem-rust/durability"]

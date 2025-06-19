@@ -1,0 +1,39 @@
+[package]
+name = "golem-search-elastic"
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+homepage = "https://golem.cloud"
+repository = "https://github.com/golemcloud/golem-search"
+description = "WebAssembly component for interacting with ElasticSearch via the golem:search interface"
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[features]
+default = ["durability"]
+durability = ["golem-rust/durability", "golem-search/durability"]
+
+[dependencies]
+golem-search = { path = "../search", version = "0.0.0", default-features = false }
+
+golem-rust = { workspace = true }
+wit-bindgen-rt = { workspace = true }
+log = { workspace = true }
+
+[package.metadata.component]
+package = "golem:search-elastic"
+
+[package.metadata.component.bindings]
+generate_unused_types = true
+
+[package.metadata.component.bindings.with]
+"golem:search/core@1.0.0" = "golem_search::golem::search::core"
+
+[package.metadata.component.target]
+path = "wit"
+
+[package.metadata.component.target.dependencies]
+"golem:search" = { path = "wit/deps/golem-search" }
+"wasi:io" = { path = "wit/deps/wasi:io" }

@@ -120,6 +120,71 @@ impl ElasticSearchClient {
             }
         })
     }
+
+    /// Creates a new index using the ElasticSearch Indices API. A caller may optionally
+    /// provide a fully-formed ElasticSearch mappings/settings JSON payload. If `mapping`
+    /// is `None` the index will be created with ElasticSearch defaults. Attempting to
+    /// create an index that already exists results in an error from ElasticSearch which
+    /// is forwarded to the caller.
+    pub fn create_index(&self, index: &str, mapping: Option<Value>) -> Result<(), Box<dyn Error>> {
+        block_on(async {
+            use elasticsearch::indices::IndicesCreateParts;
+            let response = if let Some(m) = mapping {
+                self.client
+                    .indices()
+                    .create(IndicesCreateParts::Index(index))
+                    .body(m)
+                    .send()
+                    .await?
+            } else {
+                self.client
+                    .indices()
+                    .create(IndicesCreateParts::Index(index))
+                    .send()
+                    .await?
+            };
+            let status = response.status_code();
+            match status.as_u16() {
+                200 | 201 => Ok(()),
+                _ => {
+                    let err_body = response.text().await.unwrap_or_default();
+                    Err(format!(
+                        "Failed to create index (status: {}): {}",
+                        status.as_u16(),
+                        err_body
+                    )
+                    .into())
+                }
+            }
+        })
+    }
+
+    /// Deletes an index using the ElasticSearch Indices API. Deleting a non-existing
+    /// index is treated as success to preserve idempotency.
+    pub fn delete_index(&self, index: &str) -> Result<(), Box<dyn Error>> {
+        block_on(async {
+            use elasticsearch::indices::IndicesDeleteParts;
+            let response = self
+                .client
+                .indices()
+                .delete(IndicesDeleteParts::Index(&[index]))
+                .send()
+                .await?;
+            let status = response.status_code();
+            match status.as_u16() {
+                200 | 202 | 404 => Ok(()),
+                _ => {
+                    let err_body = response.text().await.unwrap_or_default();
+                    Err(format!(
+                        "Failed to delete index (status: {}): {}",
+                        status.as_u16(),
+                        err_body
+                    )
+                    .into())
+                }
+            }
+        })
+    }
 }
 
 // Retain the original dummy function and tests until they are replaced by
@@ -170,6 +235,23 @@ mod tests {
         // Ensure deletion
         let after_delete = client.get_document(index, id).expect("get after delete");
         assert!(after_delete.is_none());
+    }
+
+    #[ignore]
+    #[test]
+    fn create_delete_index_roundtrip() {
+        std::env::set_var("SEARCH_PROVIDER_ENDPOINT", "http://localhost:9200");
+        let client = ElasticSearchClient::new().expect("client");
+        let index = "test_index_mgmt";
+
+        // Ensure index doesn't exist (ignore potential errors).
+        let _ = client.delete_index(index);
+
+        // Create index (without explicit mapping).
+        client.create_index(index, None).expect("create index");
+
+        // Delete index.
+        client.delete_index(index).expect("delete index");
     }
 }
 

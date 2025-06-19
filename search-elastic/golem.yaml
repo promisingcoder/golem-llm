@@ -1,0 +1,22 @@
+templates:
+  rust:
+    profiles:
+      debug:
+        build:
+        - command: cargo component build
+          sources:
+          - src
+          - wit-generated
+          - ../../common-rust
+          targets:
+          - ../../target/wasm32-wasip1/debug/search_elastic.wasm
+        sourceWit: wit
+        generatedWit: wit-generated
+        componentWasm: ../../target/wasm32-wasip1/debug/search_elastic.wasm
+        linkedWasm: ../../golem-temp/components/search_elastic_debug.wasm
+        clean:
+        - src/bindings.rs
+    defaultProfile: debug
+customCommands:
+  cargo-clean:
+  - command: cargo clean

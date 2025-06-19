@@ -1448,6 +1448,9 @@ name = "search-elastic"
 version = "0.1.0"
 dependencies = [
  "elasticsearch",
+ "futures",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

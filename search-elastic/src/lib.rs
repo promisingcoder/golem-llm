@@ -6,6 +6,9 @@ use std::env;
 use std::error::Error;
 use log::{debug, LevelFilter};
 use thiserror::Error;
+#[cfg(test)]
+use httpmock::prelude::*;
+use serde_json::json;
 
 /// Represents a document as defined in the `golem:search` WIT interface.
 #[derive(Debug, Clone)]
@@ -237,10 +240,40 @@ pub fn add(left: u64, right: u64) -> u64 {
     left + right
 }
 
+pub fn init() {
+    // Set up logging once using `SEARCH_PROVIDER_LOG_LEVEL` or default to INFO.
+    let level = env::var("SEARCH_PROVIDER_LOG_LEVEL").unwrap_or_else(|_| "info".into());
+    let level_filter = match level.to_ascii_lowercase().as_str() {
+        "trace" => LevelFilter::Trace,
+        "debug" => LevelFilter::Debug,
+        "warn" => LevelFilter::Warn,
+        "error" => LevelFilter::Error,
+        _ => LevelFilter::Info,
+    };
+
+    // Ignore the result if the logger was already initialised (e.g. by tests).
+    let _ = env_logger::Builder::from_default_env()
+        .filter_level(level_filter)
+        .try_init();
+}
+
+// Helper to map HTTP status codes (and optionally a response body snippet) to
+// `SearchError` variants.
+fn map_status(status: u16, body: &str) -> SearchError {
+    match status {
+        400 => SearchError::InvalidQuery(body.to_string()),
+        404 => SearchError::IndexNotFound,
+        408 | 504 => SearchError::Timeout,
+        429 => SearchError::RateLimited,
+        _ => SearchError::Internal(body.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+    use serial_test::serial;
 
     #[test]
     fn it_works() {
@@ -298,7 +331,7 @@ mod tests {
         client.delete_index(index).expect("delete index");
     }
 
-    // New tests added for Task 1.5 ------------------------------------------
+    // Existing env var and status mapping tests --------------------------------
 
     #[test]
     fn env_var_defaults_and_overrides() {
@@ -351,36 +384,115 @@ mod tests {
             _ => panic!("expected RateLimited"),
         }
     }
+
+    // New unit tests for Task 2.7 ------------------------------------------------
+
+    /// Tests the `upsert_document`, `get_document`, and `delete_document` helpers
+    /// without requiring a live ElasticSearch instance by mocking the HTTP layer.
+    #[test]
+    #[serial]
+    fn upsert_get_delete_document_mock() {
+        // Ensure a Tokio reactor is available during the synchronous helper calls.
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let _guard = rt.enter();
+        let server = MockServer::start();
+
+        let index = "books";
+        let id = "42";
+        let doc_body = r#"{"title":"The Rust Book","tags":["rust","programming"]}"#;
+
+        // Mock the INDEX (upsert) operation.
+        let _m_upsert = server.mock(|when, then| {
+            when.method(PUT)
+                .path(format!("/{}/_doc/{}", index, id));
+            then.status(201)
+                .body(r#"{"result":"created"}"#);
+        });
+
+        // Some ElasticSearch client versions use POST instead of PUT for index
+        // upsert operations. Provide an alternative mock to remain flexible.
+        let _m_upsert_post = server.mock(|when, then| {
+            when.method(POST)
+                .path(format!("/{}/_doc/{}", index, id));
+            then.status(201)
+                .body(r#"{"result":"created"}"#);
+        });
+
+        // Mock the GET operation for an existing document.
+        let _m_get_found = server.mock(|when, then| {
+            when.method(GET)
+                .path(format!("/{}/_doc/{}", index, id));
+            then.status(200)
+                .body(format!("{{\"_source\":{}}}", doc_body));
+        });
+
+        // Mock DELETE operation.
+        let _m_delete = server.mock(|when, then| {
+            when.method(DELETE)
+                .path(format!("/{}/_doc/{}", index, id));
+            then.status(200)
+                .body(r#"{"result":"deleted"}"#);
+        });
+
+        // Point the ElasticSearch client at the mock server.
+        std::env::set_var("SEARCH_PROVIDER_ENDPOINT", &server.base_url());
+
+        let client = ElasticSearchClient::new().expect("client creation");
+
+        // Upsert
+        client
+            .upsert_document(index, Doc { id: id.to_string(), content: doc_body.to_string() })
+            .expect("upsert document");
+
+        // Retrieve and verify content
+        let retrieved = client
+            .get_document(index, id)
+            .expect("get document")
+            .expect("document exists");
+        assert_eq!(retrieved, serde_json::from_str::<Value>(doc_body).unwrap());
+
+        // Delete document
+        client.delete_document(index, id).expect("delete document");
+
+        // Validate that all mocks were hit as expected.
+        assert_eq!(_m_upsert.hits() + _m_upsert_post.hits(), 1, "upsert mock should be hit exactly once");
+        assert_eq!(_m_get_found.hits(), 1, "GET (found) mock should be hit once");
+        _m_delete.assert();
+    }
+
+    /// Tests the `create_index` and `delete_index` helpers via mocked HTTP calls.
+    #[test]
+    #[serial]
+    fn create_delete_index_mock() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let _guard = rt.enter();
+        let server = MockServer::start();
+        let index = "unit_test_index";
+
+        // Mock CREATE index
+        let _m_create = server.mock(|when, then| {
+            when.method(PUT).path(format!("/{}", index));
+            then.status(200)
+                .body(r#"{"acknowledged":true}"#);
+        });
+
+        // Mock DELETE index
+        let _m_delete = server.mock(|when, then| {
+            when.method(DELETE).path(format!("/{}", index));
+            then.status(200)
+                .body(r#"{"acknowledged":true}"#);
+        });
+
+        std::env::set_var("SEARCH_PROVIDER_ENDPOINT", &server.base_url());
+        let client = ElasticSearchClient::new().expect("client creation");
+
+        client.create_index(index, None).expect("create index");
+        client.delete_index(index).expect("delete index");
+
+        _m_create.assert();
+        _m_delete.assert();
+    }
 }
 
 // Placeholder module structure for the upcoming ElasticSearch component implementation.
 // Full interface implementation will be added in future tasks.
-
-pub fn init() {
-    // Set up logging once using `SEARCH_PROVIDER_LOG_LEVEL` or default to INFO.
-    let level = env::var("SEARCH_PROVIDER_LOG_LEVEL").unwrap_or_else(|_| "info".into());
-    let level_filter = match level.to_ascii_lowercase().as_str() {
-        "trace" => LevelFilter::Trace,
-        "debug" => LevelFilter::Debug,
-        "warn" => LevelFilter::Warn,
-        "error" => LevelFilter::Error,
-        _ => LevelFilter::Info,
-    };
-
-    // Ignore the result if the logger was already initialised (e.g. by tests).
-    let _ = env_logger::Builder::from_default_env()
-        .filter_level(level_filter)
-        .try_init();
-}
-
-// Helper to map HTTP status codes (and optionally a response body snippet) to
-// `SearchError` variants.
-fn map_status(status: u16, body: &str) -> SearchError {
-    match status {
-        400 => SearchError::InvalidQuery(body.to_string()),
-        404 => SearchError::IndexNotFound,
-        408 | 504 => SearchError::Timeout,
-        429 => SearchError::RateLimited,
-        _ => SearchError::Internal(body.to_string()),
-    }
-}

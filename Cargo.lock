@@ -1911,11 +1911,14 @@ dependencies = [
  "elasticsearch",
  "env_logger",
  "futures",
+ "golem-llm",
+ "golem-rust",
  "log",
  "serde",
  "serde_json",
  "testcontainers-modules",
  "thiserror 1.0.69",
+ "wit-bindgen 0.40.0",
 ]
 
 [[package]]

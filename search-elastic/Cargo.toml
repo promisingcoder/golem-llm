@@ -7,13 +7,16 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-elasticsearch = { version = "9.0.0-alpha.1", default-features = false, features = ["rustls-tls"] }
+elasticsearch = { version = "9.0.0-alpha.1", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 futures = "0.3"
 thiserror = "1.0"
 log = "0.4"
 env_logger = "0.11"
+golem-llm = { path = "../llm" }
+golem-rust = { workspace = true }
+wit-bindgen = "0.40.0"
 
 [dev-dependencies]
 # Community maintained Testcontainers modules – we use the Elasticsearch image for real integration tests.

@@ -14,7 +14,7 @@ use log::trace;
 // Generate bindings for the search interface. The exact WIT location will be
 // finalised once the `golem:search` specification is merged upstream.
 wit_bindgen::generate!({
-    path: "../../search/wit",      // relative to this file at compile time
+    path: "../search/wit",      // relative to the crate root at compile time
     world: "search-library",
     generate_all,
     generate_unused_types: true,
@@ -22,7 +22,9 @@ wit_bindgen::generate!({
     pub_export_macro: true,
 });
 
-use self::golem::search::search::{Config, Document, Error, ErrorCode, Guest, Hit};
+pub use self::exports::golem as golem;
+
+use golem::search::search::{Config, Document, Error, ErrorCode, Guest, Hit};
 
 struct ElasticSearchComponent;
 
@@ -72,26 +74,38 @@ impl ElasticSearchComponent {
 }
 
 impl Guest for ElasticSearchComponent {
-    fn create_index(name: String, mapping_json: Option<String>, _config: Config) -> Result<(), Error> {
+    fn create_index(name: String, mapping_json: Option<String>, _config: Config) -> Result<golem::search::search::Unit, Error> {
         let client = Self::client()?;
         let mapping = mapping_json.and_then(|s| serde_json::from_str(&s).ok());
-        client.create_index(&name, mapping).map_err(|e| Self::map_error(crate::SearchError::Internal(e.to_string())))
+        client
+            .create_index(&name, mapping)
+            .map(|_| golem::search::search::Unit {})
+            .map_err(|e| Self::map_error(crate::SearchError::Internal(e.to_string())))
     }
 
-    fn delete_index(name: String, _config: Config) -> Result<(), Error> {
+    fn delete_index(name: String, _config: Config) -> Result<golem::search::search::Unit, Error> {
         let client = Self::client()?;
-        client.delete_index(&name).map_err(|e| Self::map_error(crate::SearchError::Internal(e.to_string())))
+        client
+            .delete_index(&name)
+            .map(|_| golem::search::search::Unit {})
+            .map_err(|e| Self::map_error(crate::SearchError::Internal(e.to_string())))
     }
 
-    fn upsert(index: String, doc: Document, _config: Config) -> Result<(), Error> {
+    fn upsert(index: String, doc: Document, _config: Config) -> Result<golem::search::search::Unit, Error> {
         let client = Self::client()?;
         let internal_doc = Doc { id: doc.id.clone(), content: doc.json.clone() };
-        client.upsert_document(&index, internal_doc).map_err(|e| Self::map_error(crate::SearchError::Internal(e.to_string())))
+        client
+            .upsert_document(&index, internal_doc)
+            .map(|_| golem::search::search::Unit {})
+            .map_err(|e| Self::map_error(crate::SearchError::Internal(e.to_string())))
     }
 
-    fn delete(index: String, id: String, _config: Config) -> Result<(), Error> {
+    fn delete(index: String, id: String, _config: Config) -> Result<golem::search::search::Unit, Error> {
         let client = Self::client()?;
-        client.delete_document(&index, &id).map_err(|e| Self::map_error(crate::SearchError::Internal(e.to_string())))
+        client
+            .delete_document(&index, &id)
+            .map(|_| golem::search::search::Unit {})
+            .map_err(|e| Self::map_error(crate::SearchError::Internal(e.to_string())))
     }
 
     fn get(index: String, id: String, _config: Config) -> Result<Option<Document>, Error> {
@@ -115,6 +129,5 @@ impl Guest for ElasticSearchComponent {
     // be incrementally implemented in follow-up tasks.
 }
 
-type DurableElasticSearchComponent = golem_llm::durability::DurableComponent<ElasticSearchComponent>;
-
-golem_llm::export_llm!(DurableElasticSearchComponent with_types_in self::golem);
+// For the initial build we export the raw component directly without durability wrappers.
+golem_llm::export_llm!(ElasticSearchComponent with_types_in golem_llm);

@@ -1,0 +1,67 @@
+package golem:search@1.0.0;
+
+interface search {
+  /// --- Basic Types ---
+  record kv {
+    key: string,
+    value: string,
+  }
+
+  /// Call-time configuration record. For the first milestone we only expose
+  /// a generic provider-options bag but further fields (timeouts, retries …)
+  /// can be added without breaking existing component builds.
+  record config {
+    provider-options: list<kv>,
+  }
+
+  /// A single document. The JSON field **must** contain a valid UTF-8 encoded
+  /// JSON string that represents the raw document payload. The semantic
+  /// structure is entirely owned by the provider / caller.
+  record document {
+    id: string,
+    json: string,
+  }
+
+  /// A search hit as returned by `search`. A score is optional because some
+  /// back-ends do not expose it for all query types.
+  record hit {
+    doc: document,
+    score: option<f32>,
+  }
+
+  /// A type representing an empty value (equivalent to `()` in Rust).
+  record unit {}
+
+  /// --- Error Handling ---
+  enum error-code {
+    index-not-found,
+    invalid-query,
+    unsupported,
+    timeout,
+    rate-limited,
+    internal-error,
+  }
+
+  record error {
+    code: error-code,
+    message: string,
+    provider-error-json: option<string>,
+  }
+
+  /// --- Core CRUD operations ---
+  create-index: func(name: string, mapping-json: option<string>, config: config) -> result<unit, error>;
+
+  delete-index: func(name: string, config: config) -> result<unit, error>;
+
+  upsert: func(index: string, doc: document, config: config) -> result<unit, error>;
+
+  delete: func(index: string, id: string, config: config) -> result<unit, error>;
+
+  get: func(index: string, id: string, config: config) -> result<option<document>, error>;
+
+  search: func(index: string, query: string, offset: option<u64>, size: option<u64>, config: config) -> result<list<hit>, error>;
+}
+
+world search-library {
+  export search;
+}

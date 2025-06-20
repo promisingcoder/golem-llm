@@ -1,4 +1,4 @@
-use elasticsearch::{http::transport::Transport, DeleteParts, Elasticsearch, GetParts, IndexParts};
+use elasticsearch::{http::transport::Transport, DeleteParts, Elasticsearch, GetParts, IndexParts, SearchParts};
 use elasticsearch::params::Refresh;
 use futures::executor::block_on;
 use serde_json::Value;
@@ -6,6 +6,10 @@ use std::env;
 use std::error::Error;
 use log::{debug, LevelFilter};
 use thiserror::Error;
+use std::collections::HashMap;
+use elasticsearch::http::{Method, request::JsonBody, response::Response};
+use elasticsearch::http::headers::HeaderMap;
+use std::time::Duration;
 #[cfg(test)]
 use testcontainers_modules::elastic_search::ElasticSearch as ElasticSearchContainer;
 #[cfg(test)]
@@ -234,6 +238,398 @@ impl ElasticSearchClient {
             }
         })
     }
+
+    /// Upserts a batch of documents. This is currently implemented naïvely by
+    /// delegating to `upsert_document` in a loop which is sufficient for test
+    /// workloads. A future optimisation task will migrate this to the native
+    /// ElasticSearch _bulk API for better performance and atomicity.
+    pub fn upsert_documents(&self, index: &str, docs: &[Doc]) -> Result<(), Box<dyn Error>> {
+        for doc in docs {
+            self.upsert_document(index, doc.clone())?;
+        }
+        Ok(())
+    }
+
+    /// Deletes a batch of documents. Non-existing documents are ignored to keep
+    /// the behaviour idempotent.
+    pub fn delete_documents(&self, index: &str, ids: &[&str]) -> Result<(), Box<dyn Error>> {
+        for id in ids {
+            // Ignore individual errors for documents that disappear between
+            // iterations so that the whole batch does not fail because of
+            // racing deletes.
+            let _ = self.delete_document(index, id);
+        }
+        Ok(())
+    }
+
+    /// Executes a simple full-text search with optional pagination. The query
+    /// string is passed through ElasticSearch's `query_string` query which
+    /// supports Lucene syntax. When `from`/`size` are not provided they default
+    /// to ElasticSearch defaults (0/10).
+    pub fn search_documents(
+        &self,
+        index: &str,
+        query: &str,
+        from: Option<u64>,
+        size: Option<u64>,
+    ) -> Result<Vec<Value>, Box<dyn Error>> {
+        block_on(async {
+            let mut body = serde_json::json!({
+                "query": {
+                    "query_string": { "query": query }
+                }
+            });
+            if let Some(f) = from {
+                body["from"] = serde_json::Value::from(f);
+            }
+            if let Some(s) = size {
+                body["size"] = serde_json::Value::from(s);
+            }
+
+            let response = self
+                .client
+                .search(SearchParts::Index(&[index]))
+                .body(body)
+                .send()
+                .await
+                .map_err(|e| Box::<dyn Error>::from(e))?;
+
+            let status = response.status_code();
+            if !status.is_success() {
+                let err_body = response.text().await.unwrap_or_default();
+                return Err(map_status(status.as_u16(), &err_body).into());
+            }
+
+            let value: serde_json::Value = response.json().await?;
+            let hits = value
+                .get("hits")
+                .and_then(|v| v.get("hits"))
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+
+            // Extract the `_source` part from each hit.
+            let docs: Vec<Value> = hits
+                .into_iter()
+                .filter_map(|hit| hit.get("_source").cloned())
+                .collect();
+
+            Ok(docs)
+        })
+    }
+
+    /// Retrieves the schema for a given index.
+    pub fn get_schema(&self, index: &str) -> Result<Value, Box<dyn Error>> {
+        block_on(async {
+            use elasticsearch::indices::IndicesGetMappingParts;
+            let response = self
+                .client
+                .indices()
+                .get_mapping(IndicesGetMappingParts::Index(&[index]))
+                .send()
+                .await?;
+            let status = response.status_code();
+            if !status.is_success() {
+                let err_body = response.text().await.unwrap_or_default();
+                return Err(map_status(status.as_u16(), &err_body).into());
+            }
+            let json: Value = response.json().await?;
+            Ok(json)
+        })
+    }
+
+    /// Advanced search supporting filter JSON, sorting, faceting and highlighting.
+    pub fn advanced_search(
+        &self,
+        index: &str,
+        query: &str,
+        filter_json: Option<Value>,
+        sort_json: Option<Value>,
+        highlight_fields: &[&str],
+        facet_fields: &[&str],
+        from: Option<u64>,
+        size: Option<u64>,
+    ) -> Result<(Vec<Value>, Option<HashMap<String, Vec<String>>>, Option<Value>), Box<dyn Error>> {
+        block_on(async {
+            let mut body = serde_json::json!({
+                "query": {
+                    "query_string": { "query": query }
+                }
+            });
+            if let Some(filter) = filter_json {
+                body["post_filter"] = filter;
+            }
+            if let Some(sort) = sort_json {
+                body["sort"] = sort;
+            }
+            if !highlight_fields.is_empty() {
+                let fields: Value = highlight_fields
+                    .iter()
+                    .map(|f| (f.to_string(), serde_json::json!({})))
+                    .collect::<serde_json::Map<_, _>>()
+                    .into();
+                body["highlight"] = serde_json::json!({ "fields": fields });
+            }
+            if !facet_fields.is_empty() {
+                let mut aggs = serde_json::Map::new();
+                for field in facet_fields {
+                    aggs.insert(
+                        format!("{field}_facet"),
+                        serde_json::json!({
+                            "terms": { "field": field }
+                        }),
+                    );
+                }
+                body["aggs"] = Value::Object(aggs);
+            }
+            if let Some(f) = from {
+                body["from"] = Value::from(f);
+            }
+            if let Some(s) = size {
+                body["size"] = Value::from(s);
+            }
+
+            let response = self
+                .client
+                .search(SearchParts::Index(&[index]))
+                .body(body)
+                .send()
+                .await?;
+
+            let status = response.status_code();
+            if !status.is_success() {
+                let err_body = response.text().await.unwrap_or_default();
+                return Err(map_status(status.as_u16(), &err_body).into());
+            }
+
+            let value: Value = response.json().await?;
+            let hits_arr = value
+                .get("hits").and_then(|v| v.get("hits")).and_then(|v| v.as_array()).cloned()
+                .unwrap_or_default();
+            let mut highlights_map: HashMap<String, Vec<String>> = HashMap::new();
+            let docs: Vec<Value> = hits_arr
+                .into_iter()
+                .filter_map(|hit| {
+                    if let Some(obj) = hit.as_object() {
+                        if let (Some(src), Some(id_val)) = (obj.get("_source"), obj.get("_id")) {
+                            // Collect highlight
+                            if let Some(highlight) = obj.get("highlight") {
+                                let hl_vec = highlight
+                                    .as_object()
+                                    .unwrap_or(&serde_json::Map::new())
+                                    .values()
+                                    .flat_map(|v| v.as_array().unwrap_or(&Vec::new()).clone())
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect::<Vec<String>>();
+                                highlights_map.insert(id_val.as_str().unwrap_or_default().to_string(), hl_vec);
+                            }
+                            return Some(src.clone());
+                        }
+                    }
+                    None
+                })
+                .collect();
+
+            let facets = value.get("aggregations").cloned();
+
+            Ok((docs, if highlights_map.is_empty() { None } else { Some(highlights_map) }, facets))
+        })
+    }
+
+    /// Returns list of all indices in the cluster (names only).
+    pub fn list_indices(&self) -> Result<Vec<String>, Box<dyn Error>> {
+        block_on(async {
+            let response: Response = self
+                .client
+                .transport()
+                .send(
+                    Method::Get,
+                    "/_cat/indices?format=json",
+                    HeaderMap::new(),
+                    None::<&[(&str, &str)]>,
+                    None::<&JsonBody<Value>>,
+                    None::<Duration>,
+                )
+                .await?;
+            let status = response.status_code();
+            if !status.is_success() {
+                let err_body = response.text().await.unwrap_or_default();
+                return Err(map_status(status.as_u16(), &err_body).into());
+            }
+            let value: Value = response.json().await?;
+            let indices = value
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|v| v.get("index").and_then(|i| i.as_str()).map(|s| s.to_string()))
+                .collect();
+            Ok(indices)
+        })
+    }
+
+    /// Applies an updated mapping (schema) to an index using the put mapping API.
+    pub fn update_schema(&self, index: &str, mapping: Value) -> Result<(), Box<dyn Error>> {
+        block_on(async {
+            use elasticsearch::indices::IndicesPutMappingParts;
+            let response = self
+                .client
+                .indices()
+                .put_mapping(IndicesPutMappingParts::Index(&[index]))
+                .body(mapping)
+                .send()
+                .await?;
+            let status = response.status_code();
+            if !status.is_success() {
+                let err_body = response.text().await.unwrap_or_default();
+                return Err(map_status(status.as_u16(), &err_body).into());
+            }
+            Ok(())
+        })
+    }
+
+    /// Starts a scrolling search returning a `SearchScroll` that can be used to
+    /// iterate through result pages lazily. Uses ES scroll API under the hood.
+    pub fn start_scroll_search(
+        &self,
+        index: &str,
+        query: &str,
+        page_size: u64,
+    ) -> Result<SearchScroll, Box<dyn Error>> {
+        block_on(async {
+            let body = serde_json::json!({
+                "size": page_size,
+                "query": { "query_string": { "query": query } },
+                "sort": ["_doc"]
+            });
+            let response = self
+                .client
+                .search(SearchParts::Index(&[index]))
+                .scroll("1m")
+                .body(body)
+                .send()
+                .await?;
+            let status = response.status_code();
+            if !status.is_success() {
+                let err_body = response.text().await.unwrap_or_default();
+                return Err(map_status(status.as_u16(), &err_body).into());
+            }
+            let value: Value = response.json().await?;
+            let scroll_id = value["_scroll_id"].as_str().ok_or("missing scroll_id")?.to_string();
+            let hits = value["hits"]["hits"].as_array().cloned().unwrap_or_default();
+            Ok(SearchScroll {
+                client: self.clone(),
+                scroll_id,
+                last_batch: Some(hits),
+                finished: false,
+            })
+        })
+    }
+}
+
+/// Represents a scrolling search session.
+#[derive(Clone)]
+pub struct SearchScroll {
+    client: ElasticSearchClient,
+    scroll_id: String,
+    last_batch: Option<Vec<Value>>, // first batch already fetched
+    finished: bool,
+}
+
+impl SearchScroll {
+    /// Returns the next page of search hits. `Ok(None)` when finished.
+    pub fn next_page(&mut self) -> Result<Option<Vec<Value>>, Box<dyn Error>> {
+        if self.finished {
+            return Ok(None);
+        }
+        if let Some(batch) = self.last_batch.take() {
+            if batch.is_empty() {
+                self.finished = true;
+                self.clear_scroll();
+                return Ok(None);
+            }
+            return Ok(Some(batch));
+        }
+        // fetch next batch via _search/scroll
+        let scroll_id = self.scroll_id.clone();
+        let client = self.client.clone();
+        let result: Result<(Vec<Value>, String), Box<dyn Error>> = block_on(async move {
+            let mut body_map = serde_json::Map::new();
+            body_map.insert("scroll_id".into(), Value::String(scroll_id));
+            let json_body = JsonBody::new(Value::Object(body_map));
+            let response = client
+                .client
+                .transport()
+                .send(
+                    Method::Post,
+                    "/_search/scroll",
+                    HeaderMap::new(),
+                    None::<&[(&str, &str)]>,
+                    Some(&json_body),
+                    None::<Duration>,
+                )
+                .await?;
+            let status = response.status_code();
+            if !status.is_success() {
+                let err_body = response.text().await.unwrap_or_default();
+                return Err(map_status(status.as_u16(), &err_body).into());
+            }
+            let value: Value = response.json().await?;
+            let new_scroll_id = value["_scroll_id"].as_str().unwrap_or("").to_string();
+            let hits = value["hits"]["hits"].as_array().cloned().unwrap_or_default();
+            Ok((hits, new_scroll_id))
+        });
+        match result {
+            Ok((hits, new_scroll_id)) => {
+                self.scroll_id = new_scroll_id;
+                if hits.is_empty() {
+                    self.finished = true;
+                    self.clear_scroll();
+                    Ok(None)
+                } else {
+                    Ok(Some(hits))
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn clear_scroll(&self) {
+        let scroll_id = self.scroll_id.clone();
+        let client = self.client.clone();
+        let _ = block_on(async move {
+            let mut body_map = serde_json::Map::new();
+            body_map.insert("scroll_id".into(), Value::String(scroll_id));
+            let json_body = JsonBody::new(Value::Object(body_map));
+            let _ = client
+                .client
+                .transport()
+                .send(
+                    Method::Delete,
+                    "/_search/scroll",
+                    HeaderMap::new(),
+                    None::<&[(&str, &str)]>,
+                    Some(&json_body),
+                    None::<Duration>,
+                )
+                .await;
+        });
+    }
+
+    /// Returns scroll id for persistence checkpoints.
+    pub fn checkpoint(&self) -> String {
+        self.scroll_id.clone()
+    }
+
+    /// Restores a scrolling search from a scroll id.
+    pub fn from_checkpoint(client: ElasticSearchClient, scroll_id: String) -> Self {
+        SearchScroll {
+            client,
+            scroll_id,
+            last_batch: None,
+            finished: false,
+        }
+    }
 }
 
 // Retain the original dummy function and tests until they are replaced by
@@ -394,6 +790,201 @@ mod tests {
             _ => panic!("expected RateLimited"),
         }
     }
+
+    // New tests added for Task 1.6 — bulk operations and search ------------
+
+    #[test]
+    fn bulk_upsert_delete_and_search() {
+        // Skip when Docker is unavailable.
+        if !std::path::Path::new("/var/run/docker.sock").exists() {
+            eprintln!("Docker not available – skipping bulk_upsert_delete_and_search");
+            return;
+        }
+        let container = ElasticSearchContainer::default()
+            .start()
+            .expect("failed to start Elasticsearch container");
+        let host_port = container
+            .get_host_port_ipv4(9200)
+            .expect("failed to get host port");
+        let endpoint = format!("http://127.0.0.1:{host_port}");
+        std::env::set_var("SEARCH_PROVIDER_ENDPOINT", &endpoint);
+
+        let client = ElasticSearchClient::new().expect("client");
+        let index = "test_bulk_ops";
+
+        // Prepare documents.
+        let docs: Vec<Doc> = (1..=5)
+            .map(|i| Doc {
+                id: i.to_string(),
+                content: serde_json::json!({
+                    "title": format!("Doc {i}"),
+                    "category": if i % 2 == 0 { "even" } else { "odd" }
+                })
+                .to_string(),
+            })
+            .collect();
+
+        // Bulk upsert.
+        client
+            .upsert_documents(index, &docs)
+            .expect("bulk upsert");
+
+        // Simple search for category:even.
+        let results = client
+            .search_documents(index, "category:even", None, Some(10))
+            .expect("search");
+        assert_eq!(results.len(), 2);
+
+        // Bulk delete.
+        let ids: Vec<&str> = docs.iter().map(|d| d.id.as_str()).collect();
+        client
+            .delete_documents(index, &ids)
+            .expect("bulk delete");
+
+        // Ensure documents gone.
+        let after_delete = client
+            .search_documents(index, "*", None, Some(10))
+            .expect("search after delete");
+        assert_eq!(after_delete.len(), 0);
+    }
+
+    #[test]
+    fn schema_retrieval_and_faceted_highlight_search() {
+        if !std::path::Path::new("/var/run/docker.sock").exists() {
+            eprintln!("Docker not available – skipping schema_retrieval_and_faceted_highlight_search");
+            return;
+        }
+        let container = ElasticSearchContainer::default()
+            .start()
+            .expect("failed to start Elasticsearch container");
+        let host_port = container
+            .get_host_port_ipv4(9200)
+            .expect("failed to get host port");
+        let endpoint = format!("http://127.0.0.1:{host_port}");
+        std::env::set_var("SEARCH_PROVIDER_ENDPOINT", &endpoint);
+
+        let client = ElasticSearchClient::new().expect("client");
+        let index = "test_adv_search";
+
+        // Define an explicit mapping with keyword field for category (needed for facets)
+        let mapping = serde_json::json!({
+            "mappings": {
+                "properties": {
+                    "title": { "type": "text" },
+                    "category": { "type": "keyword" }
+                }
+            }
+        });
+        // Ensure index is fresh
+        let _ = client.delete_index(index);
+        client.create_index(index, Some(mapping.clone())).expect("create index");
+
+        // Verify schema retrieval works
+        let retrieved_schema = client.get_schema(index).expect("get schema");
+        assert!(retrieved_schema.get(index).is_some(), "schema should contain index key");
+
+        // Insert docs
+        let docs: Vec<Doc> = (1..=4)
+            .map(|i| Doc {
+                id: i.to_string(),
+                content: serde_json::json!({
+                    "title": format!("Elasticsearch document {i}"),
+                    "category": if i % 2 == 0 { "even" } else { "odd" }
+                }).to_string(),
+            })
+            .collect();
+        client.upsert_documents(index, &docs).expect("upsert docs");
+
+        // Advanced search with highlight on title and facet on category
+        let (hits, highlights_opt, facets_opt) = client
+            .advanced_search(
+                index,
+                "Elasticsearch",
+                None,
+                None,
+                &["title"],
+                &["category"],
+                None,
+                Some(10),
+            )
+            .expect("advanced search");
+
+        assert_eq!(hits.len(), 4);
+        // Highlights present
+        let highlights = highlights_opt.expect("highlights");
+        assert_eq!(highlights.len(), 4);
+
+        // Facets present with expected buckets
+        let facets = facets_opt.expect("facets");
+        let buckets = facets
+            .get("category_facet")
+            .and_then(|v| v.get("buckets"))
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        // Expect at least odd and even categories
+        let mut seen = buckets
+            .into_iter()
+            .filter_map(|b| b.get("key").and_then(|k| k.as_str()).map(String::from))
+            .collect::<Vec<String>>();
+        seen.sort();
+        assert_eq!(seen, vec!["even", "odd"]);
+    }
+
+    #[test]
+    fn streaming_pagination_and_checkpoint() {
+        if !std::path::Path::new("/var/run/docker.sock").exists() {
+            eprintln!("Docker not available – skipping streaming_pagination_and_checkpoint");
+            return;
+        }
+        let container = ElasticSearchContainer::default()
+            .start()
+            .expect("failed to start Elasticsearch container");
+        let host_port = container
+            .get_host_port_ipv4(9200)
+            .expect("failed to get host port");
+        let endpoint = format!("http://127.0.0.1:{host_port}");
+        std::env::set_var("SEARCH_PROVIDER_ENDPOINT", &endpoint);
+
+        let client = ElasticSearchClient::new().expect("client");
+        let index = "test_stream_scroll";
+        let _ = client.delete_index(index);
+        client.create_index(index, None).expect("create index");
+
+        // Insert 25 docs
+        let docs: Vec<Doc> = (1..=25)
+            .map(|i| Doc {
+                id: i.to_string(),
+                content: serde_json::json!({ "title": format!("Doc {i}") }).to_string(),
+            })
+            .collect();
+        client.upsert_documents(index, &docs).expect("upsert");
+
+        // Start scrolling search with page size 10
+        let mut scroll = client
+            .start_scroll_search(index, "Doc", 10)
+            .expect("start scroll");
+
+        let mut total = 0;
+        // Fetch first page
+        if let Some(batch1) = scroll.next_page().expect("next page 1") {
+            total += batch1.len();
+            assert_eq!(batch1.len(), 10);
+        } else {
+            panic!("expected first batch");
+        }
+
+        // Simulate checkpoint persistence & component restart by recreating SearchScroll
+        let checkpoint = scroll.checkpoint();
+        let mut restored = SearchScroll::from_checkpoint(client.clone(), checkpoint);
+
+        // Continue fetching remaining pages via restored scroll
+        while let Some(batch) = restored.next_page().expect("next page") {
+            total += batch.len();
+        }
+
+        assert_eq!(total, 25);
+    }
 }
 
 // Placeholder module structure for the upcoming ElasticSearch component implementation.
@@ -427,3 +1018,6 @@ fn map_status(status: u16, body: &str) -> SearchError {
         _ => SearchError::Internal(body.to_string()),
     }
 }
+
+#[cfg(target_arch = "wasm32")]
+mod component;

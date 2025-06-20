@@ -1,0 +1,3 @@
+[target.wasm32-wasi-preview2]
+# When running tests or the component locally you can use Wasmtime with component-model enabled
+runner = "wasmtime run --wasm-features component-model --"

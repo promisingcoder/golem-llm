@@ -50,6 +50,8 @@ pub struct ElasticSearchClient {
     client: Elasticsearch,
     timeout_secs: u64,
     max_retries: usize,
+    cloud_id: Option<String>,
+    password: Option<String>,
 }
 
 impl ElasticSearchClient {
@@ -96,6 +98,8 @@ impl ElasticSearchClient {
             client: Elasticsearch::new(transport),
             timeout_secs,
             max_retries,
+            cloud_id,
+            password,
         })
     }
 
@@ -766,6 +770,27 @@ mod tests {
         // Restore original env vars.
         if let Some(v) = prev_timeout { env::set_var("SEARCH_PROVIDER_TIMEOUT", v); } else { env::remove_var("SEARCH_PROVIDER_TIMEOUT"); }
         if let Some(v) = prev_retries { env::set_var("SEARCH_PROVIDER_MAX_RETRIES", v); } else { env::remove_var("SEARCH_PROVIDER_MAX_RETRIES"); }
+    }
+
+    #[test]
+    fn cloud_id_and_password_env_vars() {
+        use std::env;
+
+        // Backup current vars
+        let prev_cloud = env::var("ELASTIC_CLOUD_ID").ok();
+        let prev_pwd = env::var("ELASTIC_PASSWORD").ok();
+
+        env::set_var("ELASTIC_CLOUD_ID", "dummy-cloud-id");
+        env::set_var("ELASTIC_PASSWORD", "secret");
+
+        let client = ElasticSearchClient::new().expect("client");
+
+        assert_eq!(client.cloud_id.as_deref(), Some("dummy-cloud-id"));
+        assert_eq!(client.password.as_deref(), Some("secret"));
+
+        // restore
+        if let Some(v) = prev_cloud { env::set_var("ELASTIC_CLOUD_ID", v); } else { env::remove_var("ELASTIC_CLOUD_ID"); }
+        if let Some(v) = prev_pwd { env::set_var("ELASTIC_PASSWORD", v); } else { env::remove_var("ELASTIC_PASSWORD"); }
     }
 
     #[test]

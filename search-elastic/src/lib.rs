@@ -297,6 +297,60 @@ mod tests {
         // Delete index.
         client.delete_index(index).expect("delete index");
     }
+
+    // New tests added for Task 1.5 ------------------------------------------
+
+    #[test]
+    fn env_var_defaults_and_overrides() {
+        use std::env;
+
+        // Backup current env vars.
+        let prev_timeout = env::var("SEARCH_PROVIDER_TIMEOUT").ok();
+        let prev_retries = env::var("SEARCH_PROVIDER_MAX_RETRIES").ok();
+
+        // Clear to test defaults.
+        env::remove_var("SEARCH_PROVIDER_TIMEOUT");
+        env::remove_var("SEARCH_PROVIDER_MAX_RETRIES");
+
+        let client_default = ElasticSearchClient::new().expect("client");
+        assert_eq!(client_default.timeout_secs, 30);
+        assert_eq!(client_default.max_retries, 3);
+
+        // Override values.
+        env::set_var("SEARCH_PROVIDER_TIMEOUT", "42");
+        env::set_var("SEARCH_PROVIDER_MAX_RETRIES", "7");
+
+        let client_override = ElasticSearchClient::new().expect("client");
+        assert_eq!(client_override.timeout_secs, 42);
+        assert_eq!(client_override.max_retries, 7);
+
+        // Restore original env vars.
+        if let Some(v) = prev_timeout { env::set_var("SEARCH_PROVIDER_TIMEOUT", v); } else { env::remove_var("SEARCH_PROVIDER_TIMEOUT"); }
+        if let Some(v) = prev_retries { env::set_var("SEARCH_PROVIDER_MAX_RETRIES", v); } else { env::remove_var("SEARCH_PROVIDER_MAX_RETRIES"); }
+    }
+
+    #[test]
+    fn status_code_error_mapping() {
+        use super::SearchError;
+
+        // 400 -> InvalidQuery
+        match super::map_status(400, "bad query") {
+            SearchError::InvalidQuery(msg) => assert_eq!(msg, "bad query"),
+            _ => panic!("expected InvalidQuery"),
+        }
+
+        // 404 -> IndexNotFound
+        match super::map_status(404, "irrelevant") {
+            SearchError::IndexNotFound => {},
+            _ => panic!("expected IndexNotFound"),
+        }
+
+        // 429 -> RateLimited
+        match super::map_status(429, "slow down") {
+            SearchError::RateLimited => {},
+            _ => panic!("expected RateLimited"),
+        }
+    }
 }
 
 // Placeholder module structure for the upcoming ElasticSearch component implementation.

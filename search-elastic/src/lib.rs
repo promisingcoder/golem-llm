@@ -1,4 +1,4 @@
-use elasticsearch::{http::transport::Transport, DeleteParts, Elasticsearch, GetParts, IndexParts};
+use elasticsearch::{http::transport::Transport, DeleteParts, Elasticsearch, GetParts, IndexParts, SearchParts};
 use elasticsearch::params::Refresh;
 use futures::executor::block_on;
 use serde_json::Value;
@@ -234,6 +234,85 @@ impl ElasticSearchClient {
             }
         })
     }
+
+    /// Upserts a batch of documents. This is currently implemented naïvely by
+    /// delegating to `upsert_document` in a loop which is sufficient for test
+    /// workloads. A future optimisation task will migrate this to the native
+    /// ElasticSearch _bulk API for better performance and atomicity.
+    pub fn upsert_documents(&self, index: &str, docs: &[Doc]) -> Result<(), Box<dyn Error>> {
+        for doc in docs {
+            self.upsert_document(index, doc.clone())?;
+        }
+        Ok(())
+    }
+
+    /// Deletes a batch of documents. Non-existing documents are ignored to keep
+    /// the behaviour idempotent.
+    pub fn delete_documents(&self, index: &str, ids: &[&str]) -> Result<(), Box<dyn Error>> {
+        for id in ids {
+            // Ignore individual errors for documents that disappear between
+            // iterations so that the whole batch does not fail because of
+            // racing deletes.
+            let _ = self.delete_document(index, id);
+        }
+        Ok(())
+    }
+
+    /// Executes a simple full-text search with optional pagination. The query
+    /// string is passed through ElasticSearch's `query_string` query which
+    /// supports Lucene syntax. When `from`/`size` are not provided they default
+    /// to ElasticSearch defaults (0/10).
+    pub fn search_documents(
+        &self,
+        index: &str,
+        query: &str,
+        from: Option<u64>,
+        size: Option<u64>,
+    ) -> Result<Vec<Value>, Box<dyn Error>> {
+        block_on(async {
+            let mut body = serde_json::json!({
+                "query": {
+                    "query_string": { "query": query }
+                }
+            });
+            if let Some(f) = from {
+                body["from"] = serde_json::Value::from(f);
+            }
+            if let Some(s) = size {
+                body["size"] = serde_json::Value::from(s);
+            }
+
+            let response = self
+                .client
+                .search(SearchParts::Index(&[index]))
+                .body(body)
+                .send()
+                .await
+                .map_err(|e| Box::<dyn Error>::from(e))?;
+
+            let status = response.status_code();
+            if !status.is_success() {
+                let err_body = response.text().await.unwrap_or_default();
+                return Err(map_status(status.as_u16(), &err_body).into());
+            }
+
+            let value: serde_json::Value = response.json().await?;
+            let hits = value
+                .get("hits")
+                .and_then(|v| v.get("hits"))
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+
+            // Extract the `_source` part from each hit.
+            let docs: Vec<Value> = hits
+                .into_iter()
+                .filter_map(|hit| hit.get("_source").cloned())
+                .collect();
+
+            Ok(docs)
+        })
+    }
 }
 
 // Retain the original dummy function and tests until they are replaced by
@@ -394,6 +473,63 @@ mod tests {
             _ => panic!("expected RateLimited"),
         }
     }
+
+    // New tests added for Task 1.6 — bulk operations and search ------------
+
+    #[test]
+    fn bulk_upsert_delete_and_search() {
+        // Skip when Docker is unavailable.
+        if !std::path::Path::new("/var/run/docker.sock").exists() {
+            eprintln!("Docker not available – skipping bulk_upsert_delete_and_search");
+            return;
+        }
+        let container = ElasticSearchContainer::default()
+            .start()
+            .expect("failed to start Elasticsearch container");
+        let host_port = container
+            .get_host_port_ipv4(9200)
+            .expect("failed to get host port");
+        let endpoint = format!("http://127.0.0.1:{host_port}");
+        std::env::set_var("SEARCH_PROVIDER_ENDPOINT", &endpoint);
+
+        let client = ElasticSearchClient::new().expect("client");
+        let index = "test_bulk_ops";
+
+        // Prepare documents.
+        let docs: Vec<Doc> = (1..=5)
+            .map(|i| Doc {
+                id: i.to_string(),
+                content: serde_json::json!({
+                    "title": format!("Doc {i}"),
+                    "category": if i % 2 == 0 { "even" } else { "odd" }
+                })
+                .to_string(),
+            })
+            .collect();
+
+        // Bulk upsert.
+        client
+            .upsert_documents(index, &docs)
+            .expect("bulk upsert");
+
+        // Simple search for category:even.
+        let results = client
+            .search_documents(index, "category:even", None, Some(10))
+            .expect("search");
+        assert_eq!(results.len(), 2);
+
+        // Bulk delete.
+        let ids: Vec<&str> = docs.iter().map(|d| d.id.as_str()).collect();
+        client
+            .delete_documents(index, &ids)
+            .expect("bulk delete");
+
+        // Ensure documents gone.
+        let after_delete = client
+            .search_documents(index, "*", None, Some(10))
+            .expect("search after delete");
+        assert_eq!(after_delete.len(), 0);
+    }
 }
 
 // Placeholder module structure for the upcoming ElasticSearch component implementation.
@@ -427,3 +563,6 @@ fn map_status(status: u16, body: &str) -> SearchError {
         _ => SearchError::Internal(body.to_string()),
     }
 }
+
+#[cfg(target_arch = "wasm32")]
+mod component;

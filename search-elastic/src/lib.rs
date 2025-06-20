@@ -6,6 +6,8 @@ use std::env;
 use std::error::Error;
 use log::{debug, LevelFilter};
 use thiserror::Error;
+#[cfg(test)]
+use httpmock::prelude::*;
 
 /// Represents a document as defined in the `golem:search` WIT interface.
 #[derive(Debug, Clone)]
@@ -241,6 +243,7 @@ pub fn add(left: u64, right: u64) -> u64 {
 mod tests {
     use super::*;
     use serde_json::json;
+    use httpmock::prelude::*;
 
     #[test]
     fn it_works() {
@@ -350,6 +353,118 @@ mod tests {
             SearchError::RateLimited => {},
             _ => panic!("expected RateLimited"),
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Task 2.7 – Unit tests that do NOT require a running ElasticSearch node.
+    // ---------------------------------------------------------------------
+
+    /// Helper that spins up a mock HTTP server and returns an `ElasticSearchClient`
+    /// configured to talk to it. Each test gets its own isolated server
+    /// instance to avoid cross-test interference.
+    fn make_mock_client(server: &MockServer) -> ElasticSearchClient {
+        // Point the client to the mock server.
+        std::env::set_var("SEARCH_PROVIDER_ENDPOINT", server.url(""));
+        ElasticSearchClient::new().expect("client init")
+    }
+
+    /// Subtask 2.7.1: Verify `upsert_document`, `get_document`, `delete_document`.
+    #[test]
+    fn upsert_get_delete_document_via_mock() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            // Arrange --------------------------------------------------------------
+            let server = MockServer::start();
+
+            let index = "unit_test_index";
+            let id = "42";
+            let doc_json = json!({"title": "Unit Doc", "tags": ["test"]});
+
+            // 1) Upsert expectation: PUT /{index}/_doc/{id}?refresh=wait_for
+            server.mock(|when, then| {
+                when.method(PUT)
+                    .path_contains(&format!("/{}/_doc/{}", index, id));
+                then.status(201)
+                    .header("content-type", "application/json")
+                    .body("{\"result\":\"created\"}");
+            });
+
+            // Accept POST as well (Elastic may use POST for index API)
+            server.mock(|when, then| {
+                when.method(POST)
+                    .path_contains(&format!("/{}/_doc/{}", index, id));
+                then.status(201)
+                    .header("content-type", "application/json")
+                    .body("{\"result\":\"created\"}");
+            });
+
+            // 2) Get expectation
+            server.mock(|when, then| {
+                when.method(GET)
+                    .path(format!("/{}/_doc/{}", index, id));
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(json!({"_source": doc_json}));
+            });
+
+            // 3) Delete expectation
+            server.mock(|when, then| {
+                when.method(DELETE)
+                    .path_contains(&format!("/{}/_doc/{}", index, id));
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body("{}");
+            });
+
+            let client = make_mock_client(&server);
+
+            // Upsert document.
+            client
+                .upsert_document(index, Doc { id: id.to_string(), content: doc_json.to_string() })
+                .expect("upsert");
+
+            // Get document.
+            let retrieved = client
+                .get_document(index, id)
+                .expect("get_document")
+                .expect("document exists");
+            assert_eq!(retrieved, doc_json);
+
+            // Delete document.
+            client
+                .delete_document(index, id)
+                .expect("delete_document");
+        });
+    }
+
+    /// Subtask 2.7.2: Verify `create_index` and `delete_index` using mock server.
+    #[test]
+    fn create_delete_index_via_mock() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            // Arrange --------------------------------------------------------------
+            let server = MockServer::start();
+            let index = "unit_test_index_mgmt";
+
+            // Create index: PUT /{index}
+            server.mock(|when, then| {
+                when.method(PUT).path(format!("/{}", index));
+                then.status(200).header("content-type", "application/json").body("{\"acknowledged\":true}");
+            });
+
+            // Delete index: DELETE /{index}
+            server.mock(|when, then| {
+                when.method(DELETE).path(format!("/{}", index));
+                then.status(200).header("content-type", "application/json").body("{\"acknowledged\":true}");
+            });
+
+            let client = make_mock_client(&server);
+
+            // Create index.
+            client.create_index(index, None).expect("create_index");
+            // Delete index.
+            client.delete_index(index).expect("delete_index");
+        });
     }
 }
 

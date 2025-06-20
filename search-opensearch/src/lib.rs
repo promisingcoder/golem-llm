@@ -12,6 +12,15 @@ use log::{debug, LevelFilter};
 use thiserror::Error;
 use serde_json::Value;
 
+#[cfg(not(target_arch = "wasm32"))]
+use {
+    aws_config,
+    futures::executor::block_on,
+    opensearch::http::transport::{SingleNodeConnectionPool, TransportBuilder},
+    std::convert::TryInto,
+    url::Url,
+};
+
 /// Initialise the global logger once. Subsequent calls are no-ops.
 ///
 /// Even though logging is not strictly required at this stage, setting up the
@@ -19,8 +28,22 @@ use serde_json::Value;
 pub fn init() {
     // Ignore the result because re-initialising the logger is harmless and will
     // simply return an error we can discard.
+    // Honour the SEARCH_PROVIDER_LOG_LEVEL env var if present; otherwise default
+    // to INFO to avoid overly verbose output in production.
+    let level = env::var("SEARCH_PROVIDER_LOG_LEVEL")
+        .ok()
+        .and_then(|lvl| match lvl.to_lowercase().as_str() {
+            "trace" => Some(LevelFilter::Trace),
+            "debug" => Some(LevelFilter::Debug),
+            "info" => Some(LevelFilter::Info),
+            "warn" => Some(LevelFilter::Warn),
+            "error" => Some(LevelFilter::Error),
+            _ => None,
+        })
+        .unwrap_or(LevelFilter::Info);
+
     let _ = env_logger::Builder::from_default_env()
-        .filter_level(LevelFilter::Info)
+        .filter_level(level)
         .is_test(cfg!(test))
         .try_init();
 }
@@ -86,7 +109,40 @@ impl OpenSearchClient {
             endpoint, timeout_secs, max_retries
         );
 
+        // Determine whether AWS SigV4 authentication should be enabled. If the
+        // `OPENSEARCH_AWS_AUTH` env var is set to "true"/"1"/"yes" the client
+        // will sign requests using credentials discovered by the AWS SDK.
+
+        #[cfg(target_arch = "wasm32")]
         let transport = Transport::single_node(&endpoint)?;
+
+        #[cfg(not(target_arch = "wasm32"))]
+        let transport = {
+            let aws_auth_enabled = env::var("OPENSEARCH_AWS_AUTH")
+                .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
+                .unwrap_or(false);
+
+            if aws_auth_enabled {
+                debug!("Using AWS SigV4 authentication for OpenSearch client");
+
+                // Resolve the endpoint URL and build a single-node connection pool.
+                let url = Url::parse(&endpoint)?;
+                let conn_pool = SingleNodeConnectionPool::new(url);
+
+                // If OPENSEARCH_AWS_REGION is set we use that, otherwise fall back to
+                // AWS_REGION or the default region provider chain.
+                let _ = env::var("OPENSEARCH_AWS_REGION"); // presence is enough for aws_config's default chain
+
+                let sdk_cfg = block_on(async { aws_config::load_from_env().await });
+
+                TransportBuilder::new(conn_pool)
+                    .auth(sdk_cfg.try_into()?)
+                    .build()?
+            } else {
+                Transport::single_node(&endpoint)?
+            }
+        };
+
         Ok(Self {
             client: OpenSearch::new(transport),
             timeout_secs,

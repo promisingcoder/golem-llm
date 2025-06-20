@@ -7,12 +7,19 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-opensearch = { version = "2.3", default-features = false, features = ["rustls-tls"] }
+opensearch = { version = "2.3", default-features = false, features = ["rustls-tls", "aws-auth"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 futures = "0.3"
 thiserror = "1.0"
 log = { workspace = true }
 env_logger = "0.11"
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+url = "2.5"
+
+# Tokio is included only for non-WASM targets.
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }
 
 # No dev-dependencies yet; integration tests will be added in later tasks.

@@ -175,14 +175,14 @@ impl OpenSearchClient {
                         .body(body)
                         .send()
                         .await
-                        .map_err(|e| Box::<dyn Error>::from(e))?
+                        .map_err(|e| Box::<dyn Error>::from(map_transport_error(&e)))?
                 } else {
                     self.client
                         .indices()
                         .create(IndicesCreateParts::Index(index))
                         .send()
                         .await
-                        .map_err(|e| Box::<dyn Error>::from(e))?
+                        .map_err(|e| Box::<dyn Error>::from(map_transport_error(&e)))?
                 };
 
                 let status = response.status_code();
@@ -217,7 +217,7 @@ impl OpenSearchClient {
                     .delete(IndicesDeleteParts::Index(&[index]))
                     .send()
                     .await
-                    .map_err(|e| Box::<dyn Error>::from(e))?;
+                    .map_err(|e| Box::<dyn Error>::from(map_transport_error(&e)))?;
 
                 let status = response.status_code();
                 match status.as_u16() {
@@ -269,7 +269,7 @@ impl OpenSearchClient {
                     .refresh(Refresh::WaitFor)
                     .send()
                     .await
-                    .map_err(|e| Box::<dyn Error>::from(e))?;
+                    .map_err(|e| Box::<dyn Error>::from(map_transport_error(&e)))?;
 
                 let status = response.status_code();
                 if !status.is_success() {
@@ -309,7 +309,7 @@ impl OpenSearchClient {
                     .refresh(Refresh::WaitFor)
                     .send()
                     .await
-                    .map_err(|e| Box::<dyn Error>::from(e))?;
+                    .map_err(|e| Box::<dyn Error>::from(map_transport_error(&e)))?;
 
                 let status = response.status_code();
                 match status.as_u16() {
@@ -350,7 +350,7 @@ impl OpenSearchClient {
                     .get(GetParts::IndexId(index, id))
                     .send()
                     .await
-                    .map_err(|e| Box::<dyn Error>::from(e))?;
+                    .map_err(|e| Box::<dyn Error>::from(map_transport_error(&e)))?;
                 let status = response.status_code();
                 match status.as_u16() {
                     200 => {
@@ -422,6 +422,25 @@ fn map_status(status: u16, body: &str) -> SearchError {
         429 => SearchError::RateLimited,
         _ => SearchError::Internal(body.to_string()),
     }
+}
+
+// Helper to translate transport/client errors (network failures, timeouts etc.)
+fn map_transport_error(err: &dyn std::error::Error) -> SearchError {
+    // Attempt to detect a timeout by inspecting the error chain
+    let mut current: Option<&dyn std::error::Error> = Some(err);
+    while let Some(e) = current {
+        let msg = e.to_string().to_lowercase();
+        if msg.contains("timeout") || msg.contains("timed out") {
+            return SearchError::Timeout;
+        }
+        if msg.contains("rate") && msg.contains("limit") {
+            return SearchError::RateLimited;
+        }
+        // Traverse the source chain
+        current = e.source();
+    }
+    // Fallback
+    SearchError::Internal(err.to_string())
 }
 
 #[cfg(test)]
@@ -496,5 +515,85 @@ mod tests {
 
         // Delete index
         client.delete_index(index).expect("delete index");
+    }
+
+    #[test]
+    fn error_mapping_index_not_found_and_timeouts() {
+        use httpmock::{Method::PUT, MockServer};
+        use serde_json::json;
+
+        let server = MockServer::start();
+
+        // 404 for upsert path simulating missing index
+        let _not_found_mock = server.mock(|when, then| {
+            when.method(PUT)
+                .path_regex("/missing_index/_doc/.*");
+            then.status(404);
+        });
+
+        // 504 timeout for create index path
+        let _timeout_mock = server.mock(|when, then| {
+            when.method(PUT)
+                .path("/timeout_index");
+            then.status(504);
+        });
+
+        std::env::set_var("SEARCH_PROVIDER_ENDPOINT", server.base_url());
+        let client = OpenSearchClient::new().expect("client");
+
+        // Index not found error
+        let result = client.upsert_document(
+            "missing_index",
+            Doc { id: "1".into(), content: json!({ "k": 1 }).to_string() },
+        );
+        match result {
+            Err(e) => {
+                let err = e.downcast_ref::<SearchError>().expect("search error");
+                assert!(matches!(err, SearchError::IndexNotFound));
+            }
+            Ok(_) => panic!("expected error"),
+        }
+
+        // Timeout error
+        let result = client.create_index("timeout_index", None);
+        match result {
+            Err(e) => {
+                let err = e.downcast_ref::<SearchError>().expect("search error");
+                assert!(matches!(err, SearchError::Timeout));
+            }
+            Ok(_) => panic!("expected timeout error"),
+        }
+    }
+
+    #[test]
+    fn invalid_query_and_rate_limited_errors() {
+        use httpmock::{Method::PUT, MockServer};
+        use serde_json::json;
+
+        let server = MockServer::start();
+
+        // 429 rate limit for delete path
+        let _rl_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::DELETE)
+                .path("/rate_index");
+            then.status(429);
+        });
+
+        std::env::set_var("SEARCH_PROVIDER_ENDPOINT", server.base_url());
+        let client = OpenSearchClient::new().expect("client");
+
+        // Invalid JSON payload
+        let invalid_doc = Doc { id: "bad".into(), content: "{ not-json".into() };
+        let err = client.upsert_document("any", invalid_doc).unwrap_err();
+        let err = err.downcast_ref::<SearchError>().expect("search error");
+        match err {
+            SearchError::InvalidQuery(_) => {},
+            _ => panic!("expected invalid query error"),
+        }
+
+        // Rate limited
+        let err = client.delete_index("rate_index").unwrap_err();
+        let err = err.downcast_ref::<SearchError>().expect("search error");
+        assert!(matches!(err, SearchError::RateLimited));
     }
 }

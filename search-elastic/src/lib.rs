@@ -7,6 +7,9 @@ use std::error::Error;
 use log::{debug, LevelFilter};
 use thiserror::Error;
 use std::collections::HashMap;
+use elasticsearch::http::{Method, request::JsonBody, response::Response};
+use elasticsearch::http::headers::HeaderMap;
+use std::time::Duration;
 #[cfg(test)]
 use testcontainers_modules::elastic_search::ElasticSearch as ElasticSearchContainer;
 #[cfg(test)]
@@ -432,6 +435,201 @@ impl ElasticSearchClient {
             Ok((docs, if highlights_map.is_empty() { None } else { Some(highlights_map) }, facets))
         })
     }
+
+    /// Returns list of all indices in the cluster (names only).
+    pub fn list_indices(&self) -> Result<Vec<String>, Box<dyn Error>> {
+        block_on(async {
+            let response: Response = self
+                .client
+                .transport()
+                .send(
+                    Method::Get,
+                    "/_cat/indices?format=json",
+                    HeaderMap::new(),
+                    None::<&[(&str, &str)]>,
+                    None::<&JsonBody<Value>>,
+                    None::<Duration>,
+                )
+                .await?;
+            let status = response.status_code();
+            if !status.is_success() {
+                let err_body = response.text().await.unwrap_or_default();
+                return Err(map_status(status.as_u16(), &err_body).into());
+            }
+            let value: Value = response.json().await?;
+            let indices = value
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|v| v.get("index").and_then(|i| i.as_str()).map(|s| s.to_string()))
+                .collect();
+            Ok(indices)
+        })
+    }
+
+    /// Applies an updated mapping (schema) to an index using the put mapping API.
+    pub fn update_schema(&self, index: &str, mapping: Value) -> Result<(), Box<dyn Error>> {
+        block_on(async {
+            use elasticsearch::indices::IndicesPutMappingParts;
+            let response = self
+                .client
+                .indices()
+                .put_mapping(IndicesPutMappingParts::Index(&[index]))
+                .body(mapping)
+                .send()
+                .await?;
+            let status = response.status_code();
+            if !status.is_success() {
+                let err_body = response.text().await.unwrap_or_default();
+                return Err(map_status(status.as_u16(), &err_body).into());
+            }
+            Ok(())
+        })
+    }
+
+    /// Starts a scrolling search returning a `SearchScroll` that can be used to
+    /// iterate through result pages lazily. Uses ES scroll API under the hood.
+    pub fn start_scroll_search(
+        &self,
+        index: &str,
+        query: &str,
+        page_size: u64,
+    ) -> Result<SearchScroll, Box<dyn Error>> {
+        block_on(async {
+            let body = serde_json::json!({
+                "size": page_size,
+                "query": { "query_string": { "query": query } },
+                "sort": ["_doc"]
+            });
+            let response = self
+                .client
+                .search(SearchParts::Index(&[index]))
+                .scroll("1m")
+                .body(body)
+                .send()
+                .await?;
+            let status = response.status_code();
+            if !status.is_success() {
+                let err_body = response.text().await.unwrap_or_default();
+                return Err(map_status(status.as_u16(), &err_body).into());
+            }
+            let value: Value = response.json().await?;
+            let scroll_id = value["_scroll_id"].as_str().ok_or("missing scroll_id")?.to_string();
+            let hits = value["hits"]["hits"].as_array().cloned().unwrap_or_default();
+            Ok(SearchScroll {
+                client: self.clone(),
+                scroll_id,
+                last_batch: Some(hits),
+                finished: false,
+            })
+        })
+    }
+}
+
+/// Represents a scrolling search session.
+#[derive(Clone)]
+pub struct SearchScroll {
+    client: ElasticSearchClient,
+    scroll_id: String,
+    last_batch: Option<Vec<Value>>, // first batch already fetched
+    finished: bool,
+}
+
+impl SearchScroll {
+    /// Returns the next page of search hits. `Ok(None)` when finished.
+    pub fn next_page(&mut self) -> Result<Option<Vec<Value>>, Box<dyn Error>> {
+        if self.finished {
+            return Ok(None);
+        }
+        if let Some(batch) = self.last_batch.take() {
+            if batch.is_empty() {
+                self.finished = true;
+                self.clear_scroll();
+                return Ok(None);
+            }
+            return Ok(Some(batch));
+        }
+        // fetch next batch via _search/scroll
+        let scroll_id = self.scroll_id.clone();
+        let client = self.client.clone();
+        let result: Result<(Vec<Value>, String), Box<dyn Error>> = block_on(async move {
+            let mut body_map = serde_json::Map::new();
+            body_map.insert("scroll_id".into(), Value::String(scroll_id));
+            let json_body = JsonBody::new(Value::Object(body_map));
+            let response = client
+                .client
+                .transport()
+                .send(
+                    Method::Post,
+                    "/_search/scroll",
+                    HeaderMap::new(),
+                    None::<&[(&str, &str)]>,
+                    Some(&json_body),
+                    None::<Duration>,
+                )
+                .await?;
+            let status = response.status_code();
+            if !status.is_success() {
+                let err_body = response.text().await.unwrap_or_default();
+                return Err(map_status(status.as_u16(), &err_body).into());
+            }
+            let value: Value = response.json().await?;
+            let new_scroll_id = value["_scroll_id"].as_str().unwrap_or("").to_string();
+            let hits = value["hits"]["hits"].as_array().cloned().unwrap_or_default();
+            Ok((hits, new_scroll_id))
+        });
+        match result {
+            Ok((hits, new_scroll_id)) => {
+                self.scroll_id = new_scroll_id;
+                if hits.is_empty() {
+                    self.finished = true;
+                    self.clear_scroll();
+                    Ok(None)
+                } else {
+                    Ok(Some(hits))
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn clear_scroll(&self) {
+        let scroll_id = self.scroll_id.clone();
+        let client = self.client.clone();
+        let _ = block_on(async move {
+            let mut body_map = serde_json::Map::new();
+            body_map.insert("scroll_id".into(), Value::String(scroll_id));
+            let json_body = JsonBody::new(Value::Object(body_map));
+            let _ = client
+                .client
+                .transport()
+                .send(
+                    Method::Delete,
+                    "/_search/scroll",
+                    HeaderMap::new(),
+                    None::<&[(&str, &str)]>,
+                    Some(&json_body),
+                    None::<Duration>,
+                )
+                .await;
+        });
+    }
+
+    /// Returns scroll id for persistence checkpoints.
+    pub fn checkpoint(&self) -> String {
+        self.scroll_id.clone()
+    }
+
+    /// Restores a scrolling search from a scroll id.
+    pub fn from_checkpoint(client: ElasticSearchClient, scroll_id: String) -> Self {
+        SearchScroll {
+            client,
+            scroll_id,
+            last_batch: None,
+            finished: false,
+        }
+    }
 }
 
 // Retain the original dummy function and tests until they are replaced by
@@ -731,6 +929,61 @@ mod tests {
             .collect::<Vec<String>>();
         seen.sort();
         assert_eq!(seen, vec!["even", "odd"]);
+    }
+
+    #[test]
+    fn streaming_pagination_and_checkpoint() {
+        if !std::path::Path::new("/var/run/docker.sock").exists() {
+            eprintln!("Docker not available – skipping streaming_pagination_and_checkpoint");
+            return;
+        }
+        let container = ElasticSearchContainer::default()
+            .start()
+            .expect("failed to start Elasticsearch container");
+        let host_port = container
+            .get_host_port_ipv4(9200)
+            .expect("failed to get host port");
+        let endpoint = format!("http://127.0.0.1:{host_port}");
+        std::env::set_var("SEARCH_PROVIDER_ENDPOINT", &endpoint);
+
+        let client = ElasticSearchClient::new().expect("client");
+        let index = "test_stream_scroll";
+        let _ = client.delete_index(index);
+        client.create_index(index, None).expect("create index");
+
+        // Insert 25 docs
+        let docs: Vec<Doc> = (1..=25)
+            .map(|i| Doc {
+                id: i.to_string(),
+                content: serde_json::json!({ "title": format!("Doc {i}") }).to_string(),
+            })
+            .collect();
+        client.upsert_documents(index, &docs).expect("upsert");
+
+        // Start scrolling search with page size 10
+        let mut scroll = client
+            .start_scroll_search(index, "Doc", 10)
+            .expect("start scroll");
+
+        let mut total = 0;
+        // Fetch first page
+        if let Some(batch1) = scroll.next_page().expect("next page 1") {
+            total += batch1.len();
+            assert_eq!(batch1.len(), 10);
+        } else {
+            panic!("expected first batch");
+        }
+
+        // Simulate checkpoint persistence & component restart by recreating SearchScroll
+        let checkpoint = scroll.checkpoint();
+        let mut restored = SearchScroll::from_checkpoint(client.clone(), checkpoint);
+
+        // Continue fetching remaining pages via restored scroll
+        while let Some(batch) = restored.next_page().expect("next page") {
+            total += batch.len();
+        }
+
+        assert_eq!(total, 25);
     }
 }
 

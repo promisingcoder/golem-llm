@@ -95,15 +95,84 @@ impl OpenSearchClient {
     }
 
     /// Creates an index with an optional schema/mapping definition.
-    #[allow(unused_variables)]
     pub fn create_index(&self, index: &str, mapping: Option<Value>) -> Result<(), Box<dyn Error>> {
-        Err(Box::new(SearchError::Unsupported))
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = index;
+            let _ = mapping;
+            return Err(Box::new(SearchError::Unsupported));
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            use futures::executor::block_on;
+            use opensearch::indices::IndicesCreateParts;
+
+            // Move ownership of mapping into the async block.
+            let mapping_body = mapping;
+
+            block_on(async {
+                let response = if let Some(body) = mapping_body {
+                    self.client
+                        .indices()
+                        .create(IndicesCreateParts::Index(index))
+                        .body(body)
+                        .send()
+                        .await
+                        .map_err(|e| Box::<dyn Error>::from(e))?
+                } else {
+                    self.client
+                        .indices()
+                        .create(IndicesCreateParts::Index(index))
+                        .send()
+                        .await
+                        .map_err(|e| Box::<dyn Error>::from(e))?
+                };
+
+                let status = response.status_code();
+                match status.as_u16() {
+                    200 | 201 => Ok(()),
+                    _ => {
+                        let err_body = response.text().await.unwrap_or_default();
+                        Err(map_status(status.as_u16(), &err_body).into())
+                    }
+                }
+            })
+        }
     }
 
     /// Deletes an index, succeeding even if the index does not exist.
-    #[allow(unused_variables)]
     pub fn delete_index(&self, index: &str) -> Result<(), Box<dyn Error>> {
-        Err(Box::new(SearchError::Unsupported))
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = index;
+            return Err(Box::new(SearchError::Unsupported));
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            use futures::executor::block_on;
+            use opensearch::indices::IndicesDeleteParts;
+
+            block_on(async {
+                let response = self
+                    .client
+                    .indices()
+                    .delete(IndicesDeleteParts::Index(&[index]))
+                    .send()
+                    .await
+                    .map_err(|e| Box::<dyn Error>::from(e))?;
+
+                let status = response.status_code();
+                match status.as_u16() {
+                    200 | 202 | 404 => Ok(()),
+                    _ => {
+                        let err_body = response.text().await.unwrap_or_default();
+                        Err(map_status(status.as_u16(), &err_body).into())
+                    }
+                }
+            })
+        }
     }
 
     /// Returns the names of all indices.

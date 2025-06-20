@@ -14,3 +14,8 @@ futures = "0.3"
 thiserror = "1.0"
 log = "0.4"
 env_logger = "0.11"
+
+[dev-dependencies]
+# Community maintained Testcontainers modules – we use the Elasticsearch image for real integration tests.
+# The "blocking" feature allows us to use the convenient `start()` helper from synchronous test code.
+testcontainers-modules = { version = "0.12", default-features = false, features = ["elastic_search", "blocking"] }

@@ -6,6 +6,11 @@ use std::env;
 use std::error::Error;
 use log::{debug, LevelFilter};
 use thiserror::Error;
+#[cfg(test)]
+use testcontainers_modules::elastic_search::ElasticSearch as ElasticSearchContainer;
+#[cfg(test)]
+#[allow(unused_imports)]
+use testcontainers_modules::testcontainers::{ImageExt, runners::SyncRunner};
 
 /// Represents a document as defined in the `golem:search` WIT interface.
 #[derive(Debug, Clone)]
@@ -248,14 +253,36 @@ mod tests {
         assert_eq!(result, 4);
     }
 
-    // These tests assume an ElasticSearch instance running on localhost:9200.
-    // They are ignored by default as CI environments might not have ElasticSearch.
-    // Run with `cargo test -- --ignored` to execute.
+    // These tests launch a real single-node Elasticsearch instance in a Docker
+    // container using the `testcontainers-modules` crate. This means they can
+    // run on any CI/host that has Docker available without requiring a
+    // separately managed Elasticsearch service.
+    //
+    // Each test spins up its own container (which typically takes only a few
+    // seconds) and configures the `SEARCH_PROVIDER_ENDPOINT` environment
+    // variable so that the `ElasticSearchClient` under test talks to that
+    // instance. When the test finishes the container is automatically
+    // terminated and removed.
+    //
+    // NOTE: When Docker is not available these tests will fail to start. If you
+    // need to temporarily disable them you can use Cargo's `--skip` flag.
 
-    #[ignore]
     #[test]
     fn upsert_get_delete_roundtrip() {
-        std::env::set_var("SEARCH_PROVIDER_ENDPOINT", "http://localhost:9200");
+        // Spin up a single-node Elasticsearch container.
+        if !std::path::Path::new("/var/run/docker.sock").exists() {
+            eprintln!("Docker not available – skipping upsert_get_delete_roundtrip");
+            return;
+        }
+        let container = ElasticSearchContainer::default()
+            .start()
+            .expect("failed to start Elasticsearch container");
+        let host_port = container
+            .get_host_port_ipv4(9200)
+            .expect("failed to get host port");
+        let endpoint = format!("http://127.0.0.1:{host_port}");
+        std::env::set_var("SEARCH_PROVIDER_ENDPOINT", &endpoint);
+
         let client = ElasticSearchClient::new().expect("client");
         let index = "test_index_crud";
         let id = "1";
@@ -279,12 +306,26 @@ mod tests {
         // Ensure deletion
         let after_delete = client.get_document(index, id).expect("get after delete");
         assert!(after_delete.is_none());
+
+        // `container` is dropped here, shutting down Elasticsearch.
     }
 
-    #[ignore]
     #[test]
     fn create_delete_index_roundtrip() {
-        std::env::set_var("SEARCH_PROVIDER_ENDPOINT", "http://localhost:9200");
+        // Start fresh Elasticsearch container for this test.
+        if !std::path::Path::new("/var/run/docker.sock").exists() {
+            eprintln!("Docker not available – skipping create_delete_index_roundtrip");
+            return;
+        }
+        let container = ElasticSearchContainer::default()
+            .start()
+            .expect("failed to start Elasticsearch container");
+        let host_port = container
+            .get_host_port_ipv4(9200)
+            .expect("failed to get host port");
+        let endpoint = format!("http://127.0.0.1:{host_port}");
+        std::env::set_var("SEARCH_PROVIDER_ENDPOINT", &endpoint);
+
         let client = ElasticSearchClient::new().expect("client");
         let index = "test_index_mgmt";
 
@@ -296,6 +337,8 @@ mod tests {
 
         // Delete index.
         client.delete_index(index).expect("delete index");
+
+        // `container` drops here.
     }
 
     // New tests added for Task 1.5 ------------------------------------------

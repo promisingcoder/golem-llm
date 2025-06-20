@@ -15,7 +15,4 @@ thiserror = "1.0"
 log = { workspace = true }
 env_logger = "0.11"
 
-[dev-dependencies]
-# Use the community-maintained Testcontainers modules with the OpenSearch image for integration testing.
-# The "blocking" feature allows synchronous test helpers.
-testcontainers-modules = { version = "0.12", default-features = false, features = ["open_search", "blocking"] }
+# No dev-dependencies yet; integration tests will be added in later tasks.

@@ -439,4 +439,62 @@ mod tests {
         assert_eq!(client.timeout_secs, 30);
         assert_eq!(client.max_retries, 3);
     }
+
+    #[test]
+    fn crud_operations_via_mock_server() {
+        use httpmock::{MockServer, Method::GET};
+        use serde_json::json;
+
+        // Spin up a lightweight HTTP mock server.
+        let server = MockServer::start();
+
+        // Mock for document retrieval path to return a _source payload.
+        let _doc_get_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path_regex("/test_index/_doc/.*");
+            then.status(200)
+                .json_body(json!({
+                    "_source": { "title": "Test" }
+                }));
+        });
+
+        // Fallback mock for any other request – acknowledge with 200 OK.
+        let _fallback = server.mock(|when, then| {
+            when.any_request();
+            then.status(200).json_body(json!({ "acknowledged": true }));
+        });
+
+        // Configure client to point to the mock server.
+        std::env::set_var("SEARCH_PROVIDER_ENDPOINT", server.base_url());
+
+        let client = OpenSearchClient::new().expect("client");
+        let index = "test_index";
+
+        // Create index
+        client.create_index(index, None).expect("create index");
+
+        // Upsert document
+        client
+            .upsert_document(
+                index,
+                Doc {
+                    id: "1".to_string(),
+                    content: json!({ "title": "Test" }).to_string(),
+                },
+            )
+            .expect("upsert document");
+
+        // Get document
+        let retrieved = client
+            .get_document(index, "1")
+            .expect("get document")
+            .expect("document should exist");
+        assert_eq!(retrieved, json!({ "title": "Test" }));
+
+        // Delete document
+        client.delete_document(index, "1").expect("delete doc");
+
+        // Delete index
+        client.delete_index(index).expect("delete index");
+    }
 }

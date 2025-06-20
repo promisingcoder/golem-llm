@@ -15,6 +15,7 @@ use testcontainers_modules::elastic_search::ElasticSearch as ElasticSearchContai
 #[cfg(test)]
 #[allow(unused_imports)]
 use testcontainers_modules::testcontainers::{ImageExt, runners::SyncRunner};
+use elasticsearch::http::transport::{SingleNodeConnectionPool, TransportBuilder};
 
 /// Represents a document as defined in the `golem:search` WIT interface.
 #[derive(Debug, Clone)]
@@ -86,11 +87,25 @@ impl ElasticSearchClient {
             password.is_some()
         );
 
-        // NOTE: For the purposes of task 1.5 we keep the transport construction
-        // simple. Advanced handling for Cloud ID and authentication will be
-        // added in later tasks. The parsed values are stored so they can be
-        // applied once a custom TransportBuilder is introduced.
-        let transport = Transport::single_node(&endpoint)?;
+        // Build an Elasticsearch transport that honours timeout/retry/env and optional cloud ID / auth.
+        let transport = if let Some(cloud) = cloud_id {
+            // Cloud configuration (fall back to password or unauthenticated)
+            let conn_pool = SingleNodeConnectionPool::new(format!("https://{}.es.amazonaws.com", cloud).parse()?);
+            TransportBuilder::new(conn_pool)
+                .timeout(Duration::from_secs(timeout_secs))
+                .max_retries(max_retries as u32)
+                .build()?
+        } else {
+            let conn_pool = SingleNodeConnectionPool::new(endpoint.parse()?);
+            let mut builder = TransportBuilder::new(conn_pool)
+                .timeout(Duration::from_secs(timeout_secs))
+                .max_retries(max_retries as u32);
+
+            if let Some(pwd) = password.clone() {
+                builder = builder.auth(elasticsearch::auth::Credentials::Basic("elastic".into(), pwd.into()));
+            }
+            builder.build()?
+        };
 
         Ok(Self {
             client: Elasticsearch::new(transport),
@@ -984,6 +999,25 @@ mod tests {
         }
 
         assert_eq!(total, 25);
+    }
+
+    #[test]
+    fn invalid_json_upsert_should_fail() {
+        let client = ElasticSearchClient::new().expect("client");
+        let res = client.upsert_document("idx", Doc { id: "1".into(), content: "{not valid json}".into() });
+        assert!(res.is_err(), "Expected error for invalid JSON");
+    }
+
+    #[test]
+    fn invalid_env_values_fall_back_to_defaults() {
+        use std::env;
+        env::set_var("SEARCH_PROVIDER_TIMEOUT", "not_a_number");
+        env::set_var("SEARCH_PROVIDER_MAX_RETRIES", "also_bad");
+        let client = ElasticSearchClient::new().expect("client");
+        assert_eq!(client.timeout_secs, 30); // default
+        assert_eq!(client.max_retries, 3);   // default
+        env::remove_var("SEARCH_PROVIDER_TIMEOUT");
+        env::remove_var("SEARCH_PROVIDER_MAX_RETRIES");
     }
 }
 

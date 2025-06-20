@@ -9,10 +9,10 @@ templates:
           - wit-generated
           - ../../common-rust
           targets:
-          - ../../target/wasm32-wasip1/debug/search_elastic.wasm
+          - ../../target/wasm32-wasi-preview2/debug/search_elastic.wasm
         sourceWit: wit
         generatedWit: wit-generated
-        componentWasm: ../../target/wasm32-wasip1/debug/search_elastic.wasm
+        componentWasm: ../../target/wasm32-wasi-preview2/debug/search_elastic.wasm
         linkedWasm: ../../golem-temp/components/search_elastic_debug.wasm
         clean:
         - src/bindings.rs

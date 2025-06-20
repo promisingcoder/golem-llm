@@ -114,7 +114,46 @@ impl OpenSearchClient {
     /// Upserts a single document.
     #[allow(unused_variables)]
     pub fn upsert_document(&self, index: &str, doc: Doc) -> Result<(), Box<dyn Error>> {
-        Err(Box::new(SearchError::Unsupported))
+        #[cfg(target_arch = "wasm32")]
+        {
+            // Networking is not available inside the guest component – gracefully
+            // degrade to an unsupported error that the higher-level bindings can
+            // translate to `search-error.unsupported`.
+            let _ = index;
+            let _ = doc;
+            return Err(Box::new(SearchError::Unsupported));
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            use futures::executor::block_on;
+            use opensearch::{IndexParts, params::Refresh};
+            use serde_json::Value;
+
+            // Map the `doc.content` JSON string into a serde_json::Value that can be
+            // supplied as the request body. Treat malformed JSON as an invalid query.
+            let json_body: Value = serde_json::from_str(&doc.content)
+                .map_err(|e| Box::<dyn Error>::from(SearchError::InvalidQuery(e.to_string())))?;
+
+            block_on(async {
+                let response = self
+                    .client
+                    .index(IndexParts::IndexId(index, &doc.id))
+                    .body(json_body)
+                    // Make the document visible to subsequent reads deterministically.
+                    .refresh(Refresh::WaitFor)
+                    .send()
+                    .await
+                    .map_err(|e| Box::<dyn Error>::from(e))?;
+
+                let status = response.status_code();
+                if !status.is_success() {
+                    let err_body = response.text().await.unwrap_or_default();
+                    return Err(map_status(status.as_u16(), &err_body).into());
+                }
+                Ok(())
+            })
+        }
     }
 
     /// Upserts a batch of documents.
@@ -126,7 +165,37 @@ impl OpenSearchClient {
     /// Deletes a single document by id.
     #[allow(unused_variables)]
     pub fn delete_document(&self, index: &str, id: &str) -> Result<(), Box<dyn Error>> {
-        Err(Box::new(SearchError::Unsupported))
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = index;
+            let _ = id;
+            return Err(Box::new(SearchError::Unsupported));
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            use futures::executor::block_on;
+            use opensearch::{DeleteParts, params::Refresh};
+
+            block_on(async {
+                let response = self
+                    .client
+                    .delete(DeleteParts::IndexId(index, id))
+                    .refresh(Refresh::WaitFor)
+                    .send()
+                    .await
+                    .map_err(|e| Box::<dyn Error>::from(e))?;
+
+                let status = response.status_code();
+                match status.as_u16() {
+                    200 | 202 | 404 => Ok(()),
+                    _ => {
+                        let err_body = response.text().await.unwrap_or_default();
+                        Err(map_status(status.as_u16(), &err_body).into())
+                    }
+                }
+            })
+        }
     }
 
     /// Deletes a list of document ids.
@@ -138,7 +207,42 @@ impl OpenSearchClient {
     /// Retrieves a single document by id.
     #[allow(unused_variables)]
     pub fn get_document(&self, index: &str, id: &str) -> Result<Option<Value>, Box<dyn Error>> {
-        Err(Box::new(SearchError::Unsupported))
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = index;
+            let _ = id;
+            return Err(Box::new(SearchError::Unsupported));
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            use futures::executor::block_on;
+            use opensearch::GetParts;
+
+            block_on(async {
+                let response = self
+                    .client
+                    .get(GetParts::IndexId(index, id))
+                    .send()
+                    .await
+                    .map_err(|e| Box::<dyn Error>::from(e))?;
+                let status = response.status_code();
+                match status.as_u16() {
+                    200 => {
+                        let json: Value = response
+                            .json()
+                            .await
+                            .map_err(|e| Box::<dyn Error>::from(e))?;
+                        Ok(json.get("_source").cloned())
+                    }
+                    404 => Ok(None),
+                    _ => {
+                        let err_body = response.text().await.unwrap_or_default();
+                        Err(map_status(status.as_u16(), &err_body).into())
+                    }
+                }
+            })
+        }
     }
 
     /// Executes a basic full-text search.
@@ -179,6 +283,19 @@ impl OpenSearchClient {
     #[allow(unused_variables)]
     pub fn update_schema(&self, index: &str, mapping: Value) -> Result<(), Box<dyn Error>> {
         Err(Box::new(SearchError::Unsupported))
+    }
+}
+
+// Helper to translate common HTTP status codes into structured SearchError
+// variants so that callers can rely on a consistent error surface across
+// different search providers.
+fn map_status(status: u16, body: &str) -> SearchError {
+    match status {
+        400 => SearchError::InvalidQuery(body.to_string()),
+        404 => SearchError::IndexNotFound,
+        408 | 504 => SearchError::Timeout,
+        429 => SearchError::RateLimited,
+        _ => SearchError::Internal(body.to_string()),
     }
 }
 

@@ -6,6 +6,7 @@ use std::env;
 use std::error::Error;
 use log::{debug, LevelFilter};
 use thiserror::Error;
+use std::collections::HashMap;
 #[cfg(test)]
 use testcontainers_modules::elastic_search::ElasticSearch as ElasticSearchContainer;
 #[cfg(test)]
@@ -313,6 +314,124 @@ impl ElasticSearchClient {
             Ok(docs)
         })
     }
+
+    /// Retrieves the schema for a given index.
+    pub fn get_schema(&self, index: &str) -> Result<Value, Box<dyn Error>> {
+        block_on(async {
+            use elasticsearch::indices::IndicesGetMappingParts;
+            let response = self
+                .client
+                .indices()
+                .get_mapping(IndicesGetMappingParts::Index(&[index]))
+                .send()
+                .await?;
+            let status = response.status_code();
+            if !status.is_success() {
+                let err_body = response.text().await.unwrap_or_default();
+                return Err(map_status(status.as_u16(), &err_body).into());
+            }
+            let json: Value = response.json().await?;
+            Ok(json)
+        })
+    }
+
+    /// Advanced search supporting filter JSON, sorting, faceting and highlighting.
+    pub fn advanced_search(
+        &self,
+        index: &str,
+        query: &str,
+        filter_json: Option<Value>,
+        sort_json: Option<Value>,
+        highlight_fields: &[&str],
+        facet_fields: &[&str],
+        from: Option<u64>,
+        size: Option<u64>,
+    ) -> Result<(Vec<Value>, Option<HashMap<String, Vec<String>>>, Option<Value>), Box<dyn Error>> {
+        block_on(async {
+            let mut body = serde_json::json!({
+                "query": {
+                    "query_string": { "query": query }
+                }
+            });
+            if let Some(filter) = filter_json {
+                body["post_filter"] = filter;
+            }
+            if let Some(sort) = sort_json {
+                body["sort"] = sort;
+            }
+            if !highlight_fields.is_empty() {
+                let fields: Value = highlight_fields
+                    .iter()
+                    .map(|f| (f.to_string(), serde_json::json!({})))
+                    .collect::<serde_json::Map<_, _>>()
+                    .into();
+                body["highlight"] = serde_json::json!({ "fields": fields });
+            }
+            if !facet_fields.is_empty() {
+                let mut aggs = serde_json::Map::new();
+                for field in facet_fields {
+                    aggs.insert(
+                        format!("{field}_facet"),
+                        serde_json::json!({
+                            "terms": { "field": field }
+                        }),
+                    );
+                }
+                body["aggs"] = Value::Object(aggs);
+            }
+            if let Some(f) = from {
+                body["from"] = Value::from(f);
+            }
+            if let Some(s) = size {
+                body["size"] = Value::from(s);
+            }
+
+            let response = self
+                .client
+                .search(SearchParts::Index(&[index]))
+                .body(body)
+                .send()
+                .await?;
+
+            let status = response.status_code();
+            if !status.is_success() {
+                let err_body = response.text().await.unwrap_or_default();
+                return Err(map_status(status.as_u16(), &err_body).into());
+            }
+
+            let value: Value = response.json().await?;
+            let hits_arr = value
+                .get("hits").and_then(|v| v.get("hits")).and_then(|v| v.as_array()).cloned()
+                .unwrap_or_default();
+            let mut highlights_map: HashMap<String, Vec<String>> = HashMap::new();
+            let docs: Vec<Value> = hits_arr
+                .into_iter()
+                .filter_map(|hit| {
+                    if let Some(obj) = hit.as_object() {
+                        if let (Some(src), Some(id_val)) = (obj.get("_source"), obj.get("_id")) {
+                            // Collect highlight
+                            if let Some(highlight) = obj.get("highlight") {
+                                let hl_vec = highlight
+                                    .as_object()
+                                    .unwrap_or(&serde_json::Map::new())
+                                    .values()
+                                    .flat_map(|v| v.as_array().unwrap_or(&Vec::new()).clone())
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect::<Vec<String>>();
+                                highlights_map.insert(id_val.as_str().unwrap_or_default().to_string(), hl_vec);
+                            }
+                            return Some(src.clone());
+                        }
+                    }
+                    None
+                })
+                .collect();
+
+            let facets = value.get("aggregations").cloned();
+
+            Ok((docs, if highlights_map.is_empty() { None } else { Some(highlights_map) }, facets))
+        })
+    }
 }
 
 // Retain the original dummy function and tests until they are replaced by
@@ -529,6 +648,89 @@ mod tests {
             .search_documents(index, "*", None, Some(10))
             .expect("search after delete");
         assert_eq!(after_delete.len(), 0);
+    }
+
+    #[test]
+    fn schema_retrieval_and_faceted_highlight_search() {
+        if !std::path::Path::new("/var/run/docker.sock").exists() {
+            eprintln!("Docker not available – skipping schema_retrieval_and_faceted_highlight_search");
+            return;
+        }
+        let container = ElasticSearchContainer::default()
+            .start()
+            .expect("failed to start Elasticsearch container");
+        let host_port = container
+            .get_host_port_ipv4(9200)
+            .expect("failed to get host port");
+        let endpoint = format!("http://127.0.0.1:{host_port}");
+        std::env::set_var("SEARCH_PROVIDER_ENDPOINT", &endpoint);
+
+        let client = ElasticSearchClient::new().expect("client");
+        let index = "test_adv_search";
+
+        // Define an explicit mapping with keyword field for category (needed for facets)
+        let mapping = serde_json::json!({
+            "mappings": {
+                "properties": {
+                    "title": { "type": "text" },
+                    "category": { "type": "keyword" }
+                }
+            }
+        });
+        // Ensure index is fresh
+        let _ = client.delete_index(index);
+        client.create_index(index, Some(mapping.clone())).expect("create index");
+
+        // Verify schema retrieval works
+        let retrieved_schema = client.get_schema(index).expect("get schema");
+        assert!(retrieved_schema.get(index).is_some(), "schema should contain index key");
+
+        // Insert docs
+        let docs: Vec<Doc> = (1..=4)
+            .map(|i| Doc {
+                id: i.to_string(),
+                content: serde_json::json!({
+                    "title": format!("Elasticsearch document {i}"),
+                    "category": if i % 2 == 0 { "even" } else { "odd" }
+                }).to_string(),
+            })
+            .collect();
+        client.upsert_documents(index, &docs).expect("upsert docs");
+
+        // Advanced search with highlight on title and facet on category
+        let (hits, highlights_opt, facets_opt) = client
+            .advanced_search(
+                index,
+                "Elasticsearch",
+                None,
+                None,
+                &["title"],
+                &["category"],
+                None,
+                Some(10),
+            )
+            .expect("advanced search");
+
+        assert_eq!(hits.len(), 4);
+        // Highlights present
+        let highlights = highlights_opt.expect("highlights");
+        assert_eq!(highlights.len(), 4);
+
+        // Facets present with expected buckets
+        let facets = facets_opt.expect("facets");
+        let buckets = facets
+            .get("category_facet")
+            .and_then(|v| v.get("buckets"))
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        // Expect at least odd and even categories
+        let mut seen = buckets
+            .into_iter()
+            .filter_map(|b| b.get("key").and_then(|k| k.as_str()).map(String::from))
+            .collect::<Vec<String>>();
+        seen.sort();
+        assert_eq!(seen, vec!["even", "odd"]);
     }
 }
 

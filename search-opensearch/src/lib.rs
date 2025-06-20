@@ -10,6 +10,7 @@ use std::env;
 use std::error::Error;
 use log::{debug, LevelFilter};
 use thiserror::Error;
+use serde_json::Value;
 
 /// Initialise the global logger once. Subsequent calls are no-ops.
 ///
@@ -41,6 +42,14 @@ pub enum SearchError {
     Timeout,
     #[error("rate limited")]
     RateLimited,
+}
+
+/// Represents a document as defined in the `golem:search` WIT interface.
+#[derive(Debug, Clone)]
+pub struct Doc {
+    pub id: String,
+    /// A JSON encoded string representing the document contents.
+    pub content: String,
 }
 
 /// Thin wrapper around the official `opensearch-rs` client. Only the minimal
@@ -83,6 +92,93 @@ impl OpenSearchClient {
             timeout_secs,
             max_retries,
         })
+    }
+
+    /// Creates an index with an optional schema/mapping definition.
+    #[allow(unused_variables)]
+    pub fn create_index(&self, index: &str, mapping: Option<Value>) -> Result<(), Box<dyn Error>> {
+        Err(Box::new(SearchError::Unsupported))
+    }
+
+    /// Deletes an index, succeeding even if the index does not exist.
+    #[allow(unused_variables)]
+    pub fn delete_index(&self, index: &str) -> Result<(), Box<dyn Error>> {
+        Err(Box::new(SearchError::Unsupported))
+    }
+
+    /// Returns the names of all indices.
+    pub fn list_indices(&self) -> Result<Vec<String>, Box<dyn Error>> {
+        Err(Box::new(SearchError::Unsupported))
+    }
+
+    /// Upserts a single document.
+    #[allow(unused_variables)]
+    pub fn upsert_document(&self, index: &str, doc: Doc) -> Result<(), Box<dyn Error>> {
+        Err(Box::new(SearchError::Unsupported))
+    }
+
+    /// Upserts a batch of documents.
+    #[allow(unused_variables)]
+    pub fn upsert_documents(&self, index: &str, docs: &[Doc]) -> Result<(), Box<dyn Error>> {
+        Err(Box::new(SearchError::Unsupported))
+    }
+
+    /// Deletes a single document by id.
+    #[allow(unused_variables)]
+    pub fn delete_document(&self, index: &str, id: &str) -> Result<(), Box<dyn Error>> {
+        Err(Box::new(SearchError::Unsupported))
+    }
+
+    /// Deletes a list of document ids.
+    #[allow(unused_variables)]
+    pub fn delete_documents(&self, index: &str, ids: &[&str]) -> Result<(), Box<dyn Error>> {
+        Err(Box::new(SearchError::Unsupported))
+    }
+
+    /// Retrieves a single document by id.
+    #[allow(unused_variables)]
+    pub fn get_document(&self, index: &str, id: &str) -> Result<Option<Value>, Box<dyn Error>> {
+        Err(Box::new(SearchError::Unsupported))
+    }
+
+    /// Executes a basic full-text search.
+    #[allow(unused_variables)]
+    pub fn search_documents(
+        &self,
+        index: &str,
+        query: &str,
+        from: Option<u64>,
+        size: Option<u64>,
+    ) -> Result<Vec<Value>, Box<dyn Error>> {
+        Err(Box::new(SearchError::Unsupported))
+    }
+
+    /// Executes an advanced search that supports filters, sorting, highlights and facets.
+    #[allow(unused_variables)]
+    pub fn advanced_search(
+        &self,
+        index: &str,
+        query: &str,
+        filter_json: Option<Value>,
+        sort_json: Option<Value>,
+        highlight_fields: &[&str],
+        facet_fields: &[&str],
+        from: Option<u64>,
+        size: Option<u64>,
+    ) -> Result<(Vec<Value>, Option<Value>, Option<Value>), Box<dyn Error>> {
+        Err(Box::new(SearchError::Unsupported))
+    }
+
+    /// Retrieves the raw schema (mapping) of an index.
+    #[allow(unused_variables)]
+    pub fn get_schema(&self, index: &str) -> Result<Value, Box<dyn Error>> {
+        Err(Box::new(SearchError::Unsupported))
+    }
+
+    /// Updates (merges) the schema for an existing index.
+    #[allow(unused_variables)]
+    pub fn update_schema(&self, index: &str, mapping: Value) -> Result<(), Box<dyn Error>> {
+        Err(Box::new(SearchError::Unsupported))
     }
 }
 

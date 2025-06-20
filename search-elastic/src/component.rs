@@ -8,7 +8,7 @@
 
 #![cfg(target_arch = "wasm32")]
 
-use crate::{ElasticSearchClient, Doc, map_status};
+use crate::{ElasticSearchClient, Doc};
 use log::trace;
 
 // Generate bindings for the search interface. The exact WIT location will be
@@ -69,29 +69,46 @@ impl ElasticSearchComponent {
             },
         }
     }
+
+    /// Converts generic boxed errors produced by the core client into the
+    /// structured `Error` type expected by the WIT bindings. When the inner
+    /// error is a `crate::SearchError` we preserve the specific variant,
+    /// otherwise we fall back to `InternalError`.
+    fn to_error(boxed: Box<dyn std::error::Error>) -> Error {
+        // Try to down-cast to our internal `SearchError` first.
+        if let Ok(search_err) = boxed.downcast::<crate::SearchError>() {
+            return Self::map_error(*search_err);
+        }
+        // Unknown error → treat as internal.
+        Error {
+            code: ErrorCode::InternalError,
+            message: boxed.to_string(),
+            provider_error_json: None,
+        }
+    }
 }
 
 impl Guest for ElasticSearchComponent {
     fn create_index(name: String, mapping_json: Option<String>, _config: Config) -> Result<(), Error> {
         let client = Self::client()?;
         let mapping = mapping_json.and_then(|s| serde_json::from_str(&s).ok());
-        client.create_index(&name, mapping).map_err(|e| Self::map_error(crate::SearchError::Internal(e.to_string())))
+        client.create_index(&name, mapping).map_err(Self::to_error)
     }
 
     fn delete_index(name: String, _config: Config) -> Result<(), Error> {
         let client = Self::client()?;
-        client.delete_index(&name).map_err(|e| Self::map_error(crate::SearchError::Internal(e.to_string())))
+        client.delete_index(&name).map_err(Self::to_error)
     }
 
     fn upsert(index: String, doc: Document, _config: Config) -> Result<(), Error> {
         let client = Self::client()?;
         let internal_doc = Doc { id: doc.id.clone(), content: doc.json.clone() };
-        client.upsert_document(&index, internal_doc).map_err(|e| Self::map_error(crate::SearchError::Internal(e.to_string())))
+        client.upsert_document(&index, internal_doc).map_err(Self::to_error)
     }
 
     fn delete(index: String, id: String, _config: Config) -> Result<(), Error> {
         let client = Self::client()?;
-        client.delete_document(&index, &id).map_err(|e| Self::map_error(crate::SearchError::Internal(e.to_string())))
+        client.delete_document(&index, &id).map_err(Self::to_error)
     }
 
     fn get(index: String, id: String, _config: Config) -> Result<Option<Document>, Error> {
@@ -99,7 +116,7 @@ impl Guest for ElasticSearchComponent {
         match client.get_document(&index, &id) {
             Ok(Some(value)) => Ok(Some(Document { id, json: value.to_string() })),
             Ok(None) => Ok(None),
-            Err(e) => Err(Self::map_error(crate::SearchError::Internal(e.to_string()))),
+            Err(e) => Err(Self::to_error(e)),
         }
     }
 
@@ -107,7 +124,7 @@ impl Guest for ElasticSearchComponent {
         let client = Self::client()?;
         match client.search_documents(&index, &query, from, size) {
             Ok(values) => Ok(values.into_iter().map(|v| Hit { doc: Document { id: String::new(), json: v.to_string() }, score: None }).collect()),
-            Err(e) => Err(Self::map_error(crate::SearchError::Internal(e.to_string()))),
+            Err(e) => Err(Self::to_error(e)),
         }
     }
 

@@ -27,7 +27,7 @@ pub struct Doc {
 /// SearchError mirrors the `search-error` variant from the WIT definition and is
 /// used as the local error representation until full component glue is
 /// generated in later tasks.
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Clone)]
 pub enum SearchError {
     #[error("index not found")]
     IndexNotFound,

@@ -4,6 +4,8 @@ use futures::executor::block_on;
 use serde_json::Value;
 use std::env;
 use std::error::Error;
+use log::{debug, LevelFilter};
+use thiserror::Error;
 
 /// Represents a document as defined in the `golem:search` WIT interface.
 #[derive(Debug, Clone)]
@@ -13,24 +15,78 @@ pub struct Doc {
     pub content: String,
 }
 
+/// SearchError mirrors the `search-error` variant from the WIT definition and is
+/// used as the local error representation until full component glue is
+/// generated in later tasks.
+#[derive(Error, Debug)]
+pub enum SearchError {
+    #[error("index not found")]
+    IndexNotFound,
+    #[error("invalid query: {0}")]
+    InvalidQuery(String),
+    #[error("unsupported operation")]
+    Unsupported,
+    #[error("internal error: {0}")]
+    Internal(String),
+    #[error("timeout")]
+    Timeout,
+    #[error("rate limited")]
+    RateLimited,
+}
+
 /// A thin convenience wrapper around the official `elasticsearch-rs` client that
 /// exposes synchronous helpers for basic CRUD operations required in task 1.3.
 #[derive(Clone)]
 pub struct ElasticSearchClient {
     client: Elasticsearch,
+    timeout_secs: u64,
+    max_retries: usize,
 }
 
 impl ElasticSearchClient {
     /// Creates a new client instance using the `SEARCH_PROVIDER_ENDPOINT` environment
     /// variable (defaults to `http://localhost:9200` when not present).
     pub fn new() -> Result<Self, Box<dyn Error>> {
-        // Read the endpoint from the environment or fall back to localhost.
+        // Ensure the logger is initialised only once (subsequent calls are no-ops).
+        init();
+
+        // Common configuration parameters.
         let endpoint = env::var("SEARCH_PROVIDER_ENDPOINT")
             .unwrap_or_else(|_| "http://localhost:9200".to_string());
 
+        let timeout_secs: u64 = env::var("SEARCH_PROVIDER_TIMEOUT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30);
+
+        let max_retries: usize = env::var("SEARCH_PROVIDER_MAX_RETRIES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3);
+
+        // Provider-specific parameters (not fully wired yet, but parsed and logged).
+        let cloud_id = env::var("ELASTIC_CLOUD_ID").ok();
+        let password = env::var("ELASTIC_PASSWORD").ok();
+
+        debug!(
+            "ElasticSearch client config — endpoint: {}, timeout: {}s, retries: {}, cloud_id set: {}, password set: {}",
+            endpoint,
+            timeout_secs,
+            max_retries,
+            cloud_id.is_some(),
+            password.is_some()
+        );
+
+        // NOTE: For the purposes of task 1.5 we keep the transport construction
+        // simple. Advanced handling for Cloud ID and authentication will be
+        // added in later tasks. The parsed values are stored so they can be
+        // applied once a custom TransportBuilder is introduced.
         let transport = Transport::single_node(&endpoint)?;
+
         Ok(Self {
             client: Elasticsearch::new(transport),
+            timeout_secs,
+            max_retries,
         })
     }
 
@@ -51,17 +107,13 @@ impl ElasticSearchClient {
                 // `refresh=wait_for` is useful in tests to make the document immediately visible.
                 .refresh(Refresh::WaitFor)
                 .send()
-                .await?;
+                .await
+                .map_err(|e| Box::<dyn Error>::from(e))?;
 
             let status = response.status_code();
             if !status.is_success() {
                 let err_body = response.text().await.unwrap_or_default();
-                return Err(format!(
-                    "Failed to upsert document (status: {}): {}",
-                    status.as_u16(),
-                    err_body
-                )
-                .into());
+                return Err(map_status(status.as_u16(), &err_body).into());
             }
             Ok(())
         })
@@ -71,23 +123,26 @@ impl ElasticSearchClient {
     /// not found.
     pub fn get_document(&self, index: &str, id: &str) -> Result<Option<Value>, Box<dyn Error>> {
         block_on(async {
-            let response = self.client.get(GetParts::IndexId(index, id)).send().await?;
+            let response = self
+                .client
+                .get(GetParts::IndexId(index, id))
+                .send()
+                .await
+                .map_err(|e| Box::<dyn Error>::from(e))?;
             let status = response.status_code();
             match status.as_u16() {
                 200 => {
-                    let json: Value = response.json().await?;
+                    let json: Value = response
+                        .json()
+                        .await
+                        .map_err(|e| Box::<dyn Error>::from(e))?;
                     // The actual document source resides under the `_source` field.
                     Ok(json.get("_source").cloned())
                 }
                 404 => Ok(None),
                 _ => {
                     let err_body = response.text().await.unwrap_or_default();
-                    Err(format!(
-                        "Failed to get document (status: {}): {}",
-                        status.as_u16(),
-                        err_body
-                    )
-                    .into())
+                    Err(map_status(status.as_u16(), &err_body).into())
                 }
             }
         })
@@ -103,19 +158,15 @@ impl ElasticSearchClient {
                 // Use `refresh=wait_for` for deterministic behaviour in tests.
                 .refresh(Refresh::WaitFor)
                 .send()
-                .await?;
+                .await
+                .map_err(|e| Box::<dyn Error>::from(e))?;
 
             let status = response.status_code();
             match status.as_u16() {
                 200 | 202 | 404 => Ok(()), // 404 means document not found -> fine for delete.
                 _ => {
                     let err_body = response.text().await.unwrap_or_default();
-                    Err(format!(
-                        "Failed to delete document (status: {}): {}",
-                        status.as_u16(),
-                        err_body
-                    )
-                    .into())
+                    Err(map_status(status.as_u16(), &err_body).into())
                 }
             }
         })
@@ -135,25 +186,22 @@ impl ElasticSearchClient {
                     .create(IndicesCreateParts::Index(index))
                     .body(m)
                     .send()
-                    .await?
+                    .await
+                    .map_err(|e| Box::<dyn Error>::from(e))?
             } else {
                 self.client
                     .indices()
                     .create(IndicesCreateParts::Index(index))
                     .send()
-                    .await?
+                    .await
+                    .map_err(|e| Box::<dyn Error>::from(e))?
             };
             let status = response.status_code();
             match status.as_u16() {
                 200 | 201 => Ok(()),
                 _ => {
                     let err_body = response.text().await.unwrap_or_default();
-                    Err(format!(
-                        "Failed to create index (status: {}): {}",
-                        status.as_u16(),
-                        err_body
-                    )
-                    .into())
+                    Err(map_status(status.as_u16(), &err_body).into())
                 }
             }
         })
@@ -169,18 +217,14 @@ impl ElasticSearchClient {
                 .indices()
                 .delete(IndicesDeleteParts::Index(&[index]))
                 .send()
-                .await?;
+                .await
+                .map_err(|e| Box::<dyn Error>::from(e))?;
             let status = response.status_code();
             match status.as_u16() {
                 200 | 202 | 404 => Ok(()),
                 _ => {
                     let err_body = response.text().await.unwrap_or_default();
-                    Err(format!(
-                        "Failed to delete index (status: {}): {}",
-                        status.as_u16(),
-                        err_body
-                    )
-                    .into())
+                    Err(map_status(status.as_u16(), &err_body).into())
                 }
             }
         })
@@ -259,5 +303,30 @@ mod tests {
 // Full interface implementation will be added in future tasks.
 
 pub fn init() {
-    // Initialize component (logging, env vars, etc.)
+    // Set up logging once using `SEARCH_PROVIDER_LOG_LEVEL` or default to INFO.
+    let level = env::var("SEARCH_PROVIDER_LOG_LEVEL").unwrap_or_else(|_| "info".into());
+    let level_filter = match level.to_ascii_lowercase().as_str() {
+        "trace" => LevelFilter::Trace,
+        "debug" => LevelFilter::Debug,
+        "warn" => LevelFilter::Warn,
+        "error" => LevelFilter::Error,
+        _ => LevelFilter::Info,
+    };
+
+    // Ignore the result if the logger was already initialised (e.g. by tests).
+    let _ = env_logger::Builder::from_default_env()
+        .filter_level(level_filter)
+        .try_init();
+}
+
+// Helper to map HTTP status codes (and optionally a response body snippet) to
+// `SearchError` variants.
+fn map_status(status: u16, body: &str) -> SearchError {
+    match status {
+        400 => SearchError::InvalidQuery(body.to_string()),
+        404 => SearchError::IndexNotFound,
+        408 | 504 => SearchError::Timeout,
+        429 => SearchError::RateLimited,
+        _ => SearchError::Internal(body.to_string()),
+    }
 }

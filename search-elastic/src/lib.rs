@@ -278,11 +278,22 @@ impl ElasticSearchClient {
         size: Option<u64>,
     ) -> Result<Vec<Value>, Box<dyn Error>> {
         block_on(async {
-            let mut body = serde_json::json!({
-                "query": {
-                    "query_string": { "query": query }
-                }
-            });
+            // Heuristically decide between `match` and `query_string`. When the user
+            // query contains Lucene special characters like `:` or wildcard tokens we
+            // fall back to `query_string` so that field directed searches (e.g.
+            // `category:even`) continue to work as expected. Otherwise we use a simple
+            // `match` for best performance and relevance.
+            let query_json = if query.contains(':') || query.contains('*') || query.contains('?') {
+                serde_json::json!({
+                    "query": { "query_string": { "query": query } }
+                })
+            } else {
+                serde_json::json!({
+                    "query": { "match": { "_all": { "query": query } } }
+                })
+            };
+
+            let mut body = query_json;
             if let Some(f) = from {
                 body["from"] = serde_json::Value::from(f);
             }

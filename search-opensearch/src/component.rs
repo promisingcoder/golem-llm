@@ -34,6 +34,41 @@ impl OpenSearchComponent {
         })
     }
 
+    fn map_error(err: crate::SearchError) -> Error {
+        match err {
+            crate::SearchError::IndexNotFound => Error {
+                code: ErrorCode::IndexNotFound,
+                message: "index not found".to_string(),
+                provider_error_json: None,
+            },
+            crate::SearchError::InvalidQuery(m) => Error {
+                code: ErrorCode::InvalidQuery,
+                message: m,
+                provider_error_json: None,
+            },
+            crate::SearchError::Unsupported => Error {
+                code: ErrorCode::Unsupported,
+                message: "unsupported operation".to_string(),
+                provider_error_json: None,
+            },
+            crate::SearchError::Timeout => Error {
+                code: ErrorCode::Timeout,
+                message: "timeout".to_string(),
+                provider_error_json: None,
+            },
+            crate::SearchError::RateLimited => Error {
+                code: ErrorCode::RateLimited,
+                message: "rate limited".to_string(),
+                provider_error_json: None,
+            },
+            crate::SearchError::Internal(m) => Error {
+                code: ErrorCode::InternalError,
+                message: m,
+                provider_error_json: None,
+            },
+        }
+    }
+
     fn unsupported() -> Error {
         Error {
             code: ErrorCode::Unsupported,
@@ -85,8 +120,26 @@ impl Guest for OpenSearchComponent {
     }
 
     fn search(_index: String, _query_json: String, _config: Config) -> Result<Vec<Hit>, Error> {
-        trace!("search called but not implemented");
-        Err(Self::unsupported())
+        let client = match Self::client() {
+            Ok(c) => c,
+            Err(e) => return Err(e),
+        };
+
+        // For now interpret `query_json` as a raw query string. Advanced mapping
+        // from structured JSON into the OpenSearch DSL will be added in later tasks.
+        match client.search_documents(&_index, &_query_json, None, None) {
+            Ok(values) => Ok(values
+                .into_iter()
+                .map(|v| Hit {
+                    doc: Document { id: String::new(), json: v.to_string() },
+                    score: None,
+                })
+                .collect()),
+            Err(e) => match e.downcast::<crate::SearchError>() {
+                Ok(boxed_se) => Err(Self::map_error(*boxed_se)),
+                Err(other) => Err(Error { code: ErrorCode::InternalError, message: other.to_string(), provider_error_json: None }),
+            },
+        }
     }
 
     fn stream_search(_index: String, _query_json: String, _config: Config) -> Result<golem_rust::wasm_rpc::Pollable, Error> {

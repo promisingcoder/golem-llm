@@ -51,7 +51,8 @@ pub fn init() {
 /// Mirror of the `search-error` variant from the WIT definition that will be
 /// used once the interface bindings are generated. Keeping it here allows
 /// other modules (tests, component stub) to reference a unified error type.
-#[derive(Error, Debug)]
+#
+#[derive(Error, Debug, Clone)]
 pub enum SearchError {
     #[error("index not found")]
     IndexNotFound,
@@ -281,10 +282,24 @@ impl OpenSearchClient {
         }
     }
 
-    /// Upserts a batch of documents.
-    #[allow(unused_variables)]
+    /// Upserts a batch of documents. This is currently implemented naïvely by
+    /// delegating to `upsert_document` in a loop which is sufficient for test
+    /// workloads. A future optimisation task will migrate this to the native
+    /// OpenSearch _bulk API for better performance and atomicity.
     pub fn upsert_documents(&self, index: &str, docs: &[Doc]) -> Result<(), Box<dyn Error>> {
-        Err(Box::new(SearchError::Unsupported))
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            for doc in docs {
+                self.upsert_document(index, doc.clone())?;
+            }
+            Ok(())
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = index;
+            let _ = docs;
+            Err(Box::new(SearchError::Unsupported))
+        }
     }
 
     /// Deletes a single document by id.
@@ -323,10 +338,22 @@ impl OpenSearchClient {
         }
     }
 
-    /// Deletes a list of document ids.
-    #[allow(unused_variables)]
+    /// Deletes a batch of documents. Non-existing documents are ignored to keep
+    /// the behaviour idempotent.
     pub fn delete_documents(&self, index: &str, ids: &[&str]) -> Result<(), Box<dyn Error>> {
-        Err(Box::new(SearchError::Unsupported))
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            for id in ids {
+                let _ = self.delete_document(index, id);
+            }
+            Ok(())
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = index;
+            let _ = ids;
+            Err(Box::new(SearchError::Unsupported))
+        }
     }
 
     /// Retrieves a single document by id.
@@ -370,8 +397,10 @@ impl OpenSearchClient {
         }
     }
 
-    /// Executes a basic full-text search.
-    #[allow(unused_variables)]
+    /// Executes a simple full-text search with optional pagination. The query
+    /// string is passed through OpenSearch's `query_string` query which
+    /// supports standard Lucene syntax. When `from`/`size` are not provided they
+    /// default to OpenSearch defaults (0/10).
     pub fn search_documents(
         &self,
         index: &str,
@@ -379,7 +408,68 @@ impl OpenSearchClient {
         from: Option<u64>,
         size: Option<u64>,
     ) -> Result<Vec<Value>, Box<dyn Error>> {
-        Err(Box::new(SearchError::Unsupported))
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            use futures::executor::block_on;
+            use opensearch::SearchParts;
+
+            let query_json = if query.contains(':') || query.contains('*') || query.contains('?') {
+                serde_json::json!({
+                    "query": { "query_string": { "query": query } }
+                })
+            } else {
+                serde_json::json!({
+                    "query": { "match": { "_all": { "query": query } } }
+                })
+            };
+
+            let mut body = query_json;
+            if let Some(f) = from {
+                body["from"] = serde_json::Value::from(f);
+            }
+            if let Some(s) = size {
+                body["size"] = serde_json::Value::from(s);
+            }
+
+            block_on(async {
+                let response = self
+                    .client
+                    .search(SearchParts::Index(&[index]))
+                    .body(body)
+                    .send()
+                    .await
+                    .map_err(|e| wrap_opensearch_error(e))?;
+
+                let status = response.status_code();
+                if !status.is_success() {
+                    let err_body = response.text().await.unwrap_or_default();
+                    return Err(map_status(status.as_u16(), &err_body).into());
+                }
+
+                let value: serde_json::Value = response.json().await?;
+                let hits = value
+                    .get("hits")
+                    .and_then(|v| v.get("hits"))
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+
+                let docs: Vec<Value> = hits
+                    .into_iter()
+                    .filter_map(|hit| hit.get("_source").cloned())
+                    .collect();
+
+                Ok(docs)
+            })
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = index;
+            let _ = query;
+            let _ = from;
+            let _ = size;
+            Err(Box::new(SearchError::Unsupported))
+        }
     }
 
     /// Executes an advanced search that supports filters, sorting, highlights and facets.

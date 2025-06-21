@@ -278,11 +278,22 @@ impl ElasticSearchClient {
         size: Option<u64>,
     ) -> Result<Vec<Value>, Box<dyn Error>> {
         block_on(async {
-            let mut body = serde_json::json!({
-                "query": {
-                    "query_string": { "query": query }
-                }
-            });
+            // Heuristically decide between `match` and `query_string`. When the user
+            // query contains Lucene special characters like `:` or wildcard tokens we
+            // fall back to `query_string` so that field directed searches (e.g.
+            // `category:even`) continue to work as expected. Otherwise we use a simple
+            // `match` for best performance and relevance.
+            let query_json = if query.contains(':') || query.contains('*') || query.contains('?') {
+                serde_json::json!({
+                    "query": { "query_string": { "query": query } }
+                })
+            } else {
+                serde_json::json!({
+                    "query": { "match": { "_all": { "query": query } } }
+                })
+            };
+
+            let mut body = query_json;
             if let Some(f) = from {
                 body["from"] = serde_json::Value::from(f);
             }
@@ -528,6 +539,40 @@ impl ElasticSearchClient {
                 finished: false,
             })
         })
+    }
+
+    /// Helper to build a JSON filter bool clause from simple `field:value` strings.
+    fn build_filter_json(filters: &[String]) -> Option<Value> {
+        if filters.is_empty() { return None; }
+        let mut filter_arr = Vec::new();
+        for f in filters {
+            // very naive parsing: field[:=]value
+            let (field, value_opt) = if let Some(pos) = f.find(':') { ( &f[..pos], &f[pos+1..] ) } else if let Some(pos) = f.find('=') { (&f[..pos], &f[pos+1..]) } else { (f.as_str(), "") };
+            if !value_opt.is_empty() {
+                filter_arr.push(serde_json::json!({ "term": { field: value_opt } }));
+            }
+        }
+        if filter_arr.is_empty() { None } else {
+            Some(serde_json::json!({
+                "bool": { "filter": filter_arr }
+            }))
+        }
+    }
+
+    /// Helper to build a JSON sort array from `field:asc|desc` strings.
+    fn build_sort_json(sort_list: &[String]) -> Option<Value> {
+        if sort_list.is_empty() { return None; }
+        let mut arr = Vec::new();
+        for s in sort_list {
+            let (field, dir) = if let Some(pos) = s.rfind(':') {
+                (&s[..pos], &s[pos+1..])
+            } else {
+                (s.as_str(), "asc")
+            };
+            let dir_norm = if dir.eq_ignore_ascii_case("desc") { "desc" } else { "asc" };
+            arr.push(serde_json::json!({ field: { "order": dir_norm } }));
+        }
+        if arr.is_empty() { None } else { Some(Value::Array(arr)) }
     }
 }
 

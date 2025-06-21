@@ -23,3 +23,11 @@ url = "2.5"
 tokio = { version = "1", features = ["rt", "macros"] }
 
 # No dev-dependencies yet; integration tests will be added in later tasks.
+
+[dev-dependencies]
+# Integration tests rely on a real OpenSearch node provided by Testcontainers.
+# The "blocking" feature enables the convenient SyncRunner helpers used from
+# synchronous test code.
+# Note: The module name for OpenSearch follows the `open_search` feature naming
+# convention used across testcontainers-modules.
+ testcontainers-modules = { version = "0.12", default-features = false, features = ["open_search", "blocking"] }

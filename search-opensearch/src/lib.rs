@@ -175,14 +175,14 @@ impl OpenSearchClient {
                         .body(body)
                         .send()
                         .await
-                        .map_err(|e| Box::<dyn Error>::from(e))?
+                        .map_err(|e| wrap_opensearch_error(e))?
                 } else {
                     self.client
                         .indices()
                         .create(IndicesCreateParts::Index(index))
                         .send()
                         .await
-                        .map_err(|e| Box::<dyn Error>::from(e))?
+                        .map_err(|e| wrap_opensearch_error(e))?
                 };
 
                 let status = response.status_code();
@@ -217,7 +217,7 @@ impl OpenSearchClient {
                     .delete(IndicesDeleteParts::Index(&[index]))
                     .send()
                     .await
-                    .map_err(|e| Box::<dyn Error>::from(e))?;
+                    .map_err(|e| wrap_opensearch_error(e))?;
 
                 let status = response.status_code();
                 match status.as_u16() {
@@ -269,7 +269,7 @@ impl OpenSearchClient {
                     .refresh(Refresh::WaitFor)
                     .send()
                     .await
-                    .map_err(|e| Box::<dyn Error>::from(e))?;
+                    .map_err(|e| wrap_opensearch_error(e))?;
 
                 let status = response.status_code();
                 if !status.is_success() {
@@ -309,7 +309,7 @@ impl OpenSearchClient {
                     .refresh(Refresh::WaitFor)
                     .send()
                     .await
-                    .map_err(|e| Box::<dyn Error>::from(e))?;
+                    .map_err(|e| wrap_opensearch_error(e))?;
 
                 let status = response.status_code();
                 match status.as_u16() {
@@ -350,14 +350,14 @@ impl OpenSearchClient {
                     .get(GetParts::IndexId(index, id))
                     .send()
                     .await
-                    .map_err(|e| Box::<dyn Error>::from(e))?;
+                    .map_err(|e| wrap_opensearch_error(e))?;
                 let status = response.status_code();
                 match status.as_u16() {
                     200 => {
                         let json: Value = response
                             .json()
                             .await
-                            .map_err(|e| Box::<dyn Error>::from(e))?;
+                            .map_err(|e| wrap_opensearch_error(e))?;
                         Ok(json.get("_source").cloned())
                     }
                     404 => Ok(None),
@@ -424,6 +424,38 @@ fn map_status(status: u16, body: &str) -> SearchError {
     }
 }
 
+/// Implement conversion from the opensearch-rs error type into our SearchError so
+/// that all lower level failures are surfaced through the unified error enum.
+impl From<opensearch::Error> for SearchError {
+    fn from(err: opensearch::Error) -> Self {
+        // The public error API of opensearch-rs intentionally hides the exact
+        // enum variants from downstream crates, so we rely on the string
+        // representation as the next-best signal to categorise common cases.
+        // This is good enough for the initial mapping required by Task 2.6 and
+        // can be refined later if the client exposes a richer API.
+        let msg = err.to_string();
+        if msg.to_lowercase().contains("timeout") {
+            SearchError::Timeout
+        } else if msg.to_lowercase().contains("rate") && msg.to_lowercase().contains("limit") {
+            SearchError::RateLimited
+        } else {
+            // Attempt to extract a HTTP status code from the message. The
+            // opensearch client embeds it like `status: 404` in Display.
+            if let Some(code) = msg.split_whitespace().find_map(|p| p.parse::<u16>().ok()) {
+                return map_status(code, &msg);
+            }
+            SearchError::Internal(msg)
+        }
+    }
+}
+
+/// Convenience helper that converts an `opensearch::Error` into a boxed
+/// `SearchError` so it can be propagated through public APIs that currently
+/// expose `Box<dyn Error>`.
+fn wrap_opensearch_error(err: opensearch::Error) -> Box<dyn Error> {
+    Box::new(SearchError::from(err))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -438,5 +470,93 @@ mod tests {
         let client = OpenSearchClient::new().expect("client should initialise");
         assert_eq!(client.timeout_secs, 30);
         assert_eq!(client.max_retries, 3);
+    }
+
+    // ---------------- Integration tests using a real OpenSearch instance ----------------
+
+    // These tests spin up an OpenSearch container via the community maintained
+    // `testcontainers-modules` crate. They will be skipped automatically when
+    // Docker is unavailable (for example on CI nodes without the Docker
+    // socket). Each test starts its own single-node cluster which is
+    // automatically torn down when the `container` value is dropped.
+
+    use serde_json::json;
+
+    #[test]
+    fn upsert_get_delete_roundtrip() {
+        // Skip when the Docker daemon socket is not present.
+        if !std::path::Path::new("/var/run/docker.sock").exists() {
+            eprintln!("Docker not available – skipping upsert_get_delete_roundtrip");
+            return;
+        }
+
+        use testcontainers_modules::open_search::OpenSearch as OpenSearchContainer;
+
+        let container = OpenSearchContainer::default()
+            .start()
+            .expect("failed to start OpenSearch container");
+
+        let host_port = container
+            .get_host_port_ipv4(9200)
+            .expect("failed to get mapped port");
+        let endpoint = format!("http://127.0.0.1:{host_port}");
+        std::env::set_var("SEARCH_PROVIDER_ENDPOINT", &endpoint);
+
+        let client = OpenSearchClient::new().expect("client");
+
+        let index = "test_index_crud";
+        let id = "1";
+        let payload = json!({"title": "Test Document", "tags": ["rust", "wasm"]}).to_string();
+
+        // Make sure index exists
+        let _ = client.create_index(index, None);
+
+        // Upsert
+        client
+            .upsert_document(index, Doc { id: id.to_string(), content: payload.clone() })
+            .expect("upsert");
+
+        // Get
+        let retrieved = client
+            .get_document(index, id)
+            .expect("get")
+            .expect("document should exist");
+        assert_eq!(retrieved, serde_json::from_str::<serde_json::Value>(&payload).unwrap());
+
+        // Delete
+        client.delete_document(index, id).expect("delete");
+
+        // Ensure deletion
+        let after_delete = client.get_document(index, id).expect("get after delete");
+        assert!(after_delete.is_none());
+    }
+
+    #[test]
+    fn create_delete_index_roundtrip() {
+        if !std::path::Path::new("/var/run/docker.sock").exists() {
+            eprintln!("Docker not available – skipping create_delete_index_roundtrip");
+            return;
+        }
+
+        use testcontainers_modules::open_search::OpenSearch as OpenSearchContainer;
+
+        let container = OpenSearchContainer::default()
+            .start()
+            .expect("failed to start OpenSearch container");
+
+        let host_port = container
+            .get_host_port_ipv4(9200)
+            .expect("failed to get mapped port");
+        let endpoint = format!("http://127.0.0.1:{host_port}");
+        std::env::set_var("SEARCH_PROVIDER_ENDPOINT", &endpoint);
+
+        let client = OpenSearchClient::new().expect("client");
+        let index = "test_index_mgmt";
+
+        // Ensure index doesn't exist (ignore potential errors).
+        let _ = client.delete_index(index);
+
+        client.create_index(index, None).expect("create index");
+        client.delete_index(index).expect("delete index");
     }
 }

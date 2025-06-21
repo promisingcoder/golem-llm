@@ -472,20 +472,119 @@ impl OpenSearchClient {
         }
     }
 
+    /// Build JSON filter bool clause from simple `field:value` strings.
+    fn build_filter_json(filters: &[String]) -> Option<Value> {
+        if filters.is_empty() { return None; }
+        let mut arr = Vec::new();
+        for f in filters {
+            let (field, val) = if let Some(p) = f.find(':') { (&f[..p], &f[p+1..]) } else if let Some(p) = f.find('=') { (&f[..p], &f[p+1..]) } else { (f.as_str(), "") };
+            if !val.is_empty() {
+                arr.push(serde_json::json!({ "term": { field: val } }));
+            }
+        }
+        if arr.is_empty() { None } else {
+            Some(serde_json::json!({ "bool": { "filter": arr } }))
+        }
+    }
+
+    /// Build JSON sort from `field:asc|desc` strings.
+    fn build_sort_json(sort: &[String]) -> Option<Value> {
+        if sort.is_empty() { return None; }
+        let mut arr = Vec::new();
+        for s in sort {
+            let (field, dir) = if let Some(p) = s.rfind(':') { (&s[..p], &s[p+1..]) } else { (s.as_str(), "asc") };
+            let dir_norm = if dir.eq_ignore_ascii_case("desc") { "desc" } else { "asc" };
+            arr.push(serde_json::json!({ field: { "order": dir_norm } }));
+        }
+        if arr.is_empty() { None } else { Some(Value::Array(arr)) }
+    }
+
     /// Executes an advanced search that supports filters, sorting, highlights and facets.
     #[allow(unused_variables)]
     pub fn advanced_search(
         &self,
         index: &str,
         query: &str,
-        filter_json: Option<Value>,
-        sort_json: Option<Value>,
+        filters: &[String],
+        sort: &[String],
         highlight_fields: &[&str],
         facet_fields: &[&str],
         from: Option<u64>,
         size: Option<u64>,
     ) -> Result<(Vec<Value>, Option<Value>, Option<Value>), Box<dyn Error>> {
-        Err(Box::new(SearchError::Unsupported))
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = index; let _=query; let _=filters; let _=sort; let _=highlight_fields; let _=facet_fields; let _=from; let _=size;
+            return Err(Box::new(SearchError::Unsupported));
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            use futures::executor::block_on;
+            use opensearch::SearchParts;
+
+            let filter_json = Self::build_filter_json(filters);
+            let sort_json = Self::build_sort_json(sort);
+
+            block_on(async {
+                let mut body = serde_json::json!({
+                    "query": {
+                        "query_string": { "query": query }
+                    }
+                });
+
+                if let Some(filt) = filter_json {
+                    body["post_filter"] = filt;
+                }
+                if let Some(sortv) = sort_json {
+                    body["sort"] = sortv;
+                }
+                if !highlight_fields.is_empty() {
+                    let fields_val: Value = highlight_fields.iter().map(|f| (f.to_string(), serde_json::json!({}))).collect::<serde_json::Map<_,_>>().into();
+                    body["highlight"] = serde_json::json!({ "fields": fields_val });
+                }
+                if !facet_fields.is_empty() {
+                    let mut aggs = serde_json::Map::new();
+                    for field in facet_fields {
+                        aggs.insert(format!("{}_facet", field), serde_json::json!({ "terms": { "field": field } }));
+                    }
+                    body["aggs"] = Value::Object(aggs);
+                }
+                if let Some(f) = from { body["from"] = Value::from(f); }
+                if let Some(s) = size { body["size"] = Value::from(s); }
+
+                let response = self.client
+                    .search(SearchParts::Index(&[index]))
+                    .body(body)
+                    .send()
+                    .await
+                    .map_err(|e| wrap_opensearch_error(e))?;
+
+                let status = response.status_code();
+                if !status.is_success() {
+                    let err_body = response.text().await.unwrap_or_default();
+                    return Err(map_status(status.as_u16(), &err_body).into());
+                }
+
+                let value: Value = response.json().await?;
+                let hits_arr = value.get("hits").and_then(|v| v.get("hits")).and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                let docs: Vec<Value> = hits_arr.iter().filter_map(|hit| hit.get("_source").cloned()).collect();
+
+                let highlights = value.get("hits").and_then(|v| v.get("hits")).and_then(|hits| {
+                    let mut map = serde_json::Map::new();
+                    for h in hits.as_array().unwrap_or(&Vec::new()) {
+                        if let (Some(id), Some(hl)) = (h.get("_id"), h.get("highlight")) {
+                            map.insert(id.to_string(), hl.clone());
+                        }
+                    }
+                    if map.is_empty() { None } else { Some(Value::Object(map)) }
+                });
+
+                let facets = value.get("aggregations").cloned();
+
+                Ok((docs, highlights, facets))
+            })
+        }
     }
 
     /// Retrieves the raw schema (mapping) of an index.

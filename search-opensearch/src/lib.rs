@@ -175,14 +175,14 @@ impl OpenSearchClient {
                         .body(body)
                         .send()
                         .await
-                        .map_err(|e| Box::<dyn Error>::from(e))?
+                        .map_err(|e| Box::new(map_opensearch_error(e)))?
                 } else {
                     self.client
                         .indices()
                         .create(IndicesCreateParts::Index(index))
                         .send()
                         .await
-                        .map_err(|e| Box::<dyn Error>::from(e))?
+                        .map_err(|e| Box::new(map_opensearch_error(e)))?
                 };
 
                 let status = response.status_code();
@@ -190,7 +190,7 @@ impl OpenSearchClient {
                     200 | 201 => Ok(()),
                     _ => {
                         let err_body = response.text().await.unwrap_or_default();
-                        Err(map_status(status.as_u16(), &err_body).into())
+                        Err(Box::new(map_status(status.as_u16(), &err_body)))
                     }
                 }
             })
@@ -217,14 +217,14 @@ impl OpenSearchClient {
                     .delete(IndicesDeleteParts::Index(&[index]))
                     .send()
                     .await
-                    .map_err(|e| Box::<dyn Error>::from(e))?;
+                    .map_err(|e| Box::new(map_opensearch_error(e)))?;
 
                 let status = response.status_code();
                 match status.as_u16() {
                     200 | 202 | 404 => Ok(()),
                     _ => {
                         let err_body = response.text().await.unwrap_or_default();
-                        Err(map_status(status.as_u16(), &err_body).into())
+                        Err(Box::new(map_status(status.as_u16(), &err_body)))
                     }
                 }
             })
@@ -258,7 +258,7 @@ impl OpenSearchClient {
             // Map the `doc.content` JSON string into a serde_json::Value that can be
             // supplied as the request body. Treat malformed JSON as an invalid query.
             let json_body: Value = serde_json::from_str(&doc.content)
-                .map_err(|e| Box::<dyn Error>::from(SearchError::InvalidQuery(e.to_string())))?;
+                .map_err(|e| Box::new(SearchError::InvalidQuery(e.to_string())))?;
 
             block_on(async {
                 let response = self
@@ -269,12 +269,12 @@ impl OpenSearchClient {
                     .refresh(Refresh::WaitFor)
                     .send()
                     .await
-                    .map_err(|e| Box::<dyn Error>::from(e))?;
+                    .map_err(|e| Box::new(map_opensearch_error(e)))?;
 
                 let status = response.status_code();
                 if !status.is_success() {
                     let err_body = response.text().await.unwrap_or_default();
-                    return Err(map_status(status.as_u16(), &err_body).into());
+                    return Err(Box::new(map_status(status.as_u16(), &err_body)));
                 }
                 Ok(())
             })
@@ -309,14 +309,14 @@ impl OpenSearchClient {
                     .refresh(Refresh::WaitFor)
                     .send()
                     .await
-                    .map_err(|e| Box::<dyn Error>::from(e))?;
+                    .map_err(|e| Box::new(map_opensearch_error(e)))?;
 
                 let status = response.status_code();
                 match status.as_u16() {
                     200 | 202 | 404 => Ok(()),
                     _ => {
                         let err_body = response.text().await.unwrap_or_default();
-                        Err(map_status(status.as_u16(), &err_body).into())
+                        Err(Box::new(map_status(status.as_u16(), &err_body)))
                     }
                 }
             })
@@ -350,20 +350,20 @@ impl OpenSearchClient {
                     .get(GetParts::IndexId(index, id))
                     .send()
                     .await
-                    .map_err(|e| Box::<dyn Error>::from(e))?;
+                    .map_err(|e| Box::new(map_opensearch_error(e)))?;
                 let status = response.status_code();
                 match status.as_u16() {
                     200 => {
                         let json: Value = response
                             .json()
                             .await
-                            .map_err(|e| Box::<dyn Error>::from(e))?;
+                            .map_err(|e| Box::new(e))?;
                         Ok(json.get("_source").cloned())
                     }
                     404 => Ok(None),
                     _ => {
                         let err_body = response.text().await.unwrap_or_default();
-                        Err(map_status(status.as_u16(), &err_body).into())
+                        Err(Box::new(map_status(status.as_u16(), &err_body)))
                     }
                 }
             })
@@ -422,6 +422,37 @@ fn map_status(status: u16, body: &str) -> SearchError {
         429 => SearchError::RateLimited,
         _ => SearchError::Internal(body.to_string()),
     }
+}
+
+// Helper to translate errors returned directly by the OpenSearch client (for
+// example connection failures, request building errors or time-outs) into the
+// internal `SearchError` type so that callers receive a consistent error
+// surface.
+#[cfg(not(target_arch = "wasm32"))]
+fn map_opensearch_error(err: opensearch::Error) -> SearchError {
+    // The public error type exposed by the `opensearch` crate does not expose a
+    // rich enum that we can exhaustively match on without depending on its
+    // non-public implementation details. Instead we rely on the helper
+    // accessor methods and – as a last resort – perform coarse string matching
+    // on the formatted error. This provides a *good enough* first-pass mapping
+    // that can be refined later without breaking the public API.
+    if err.is_timeout() {
+        return SearchError::Timeout;
+    }
+
+    // Unfortunately the `is_timeout()` helper does not catch lower level I/O
+    // time-outs that may be reported by the underlying HTTP client. To account
+    // for those we fall back to a best-effort string inspection.
+    let err_msg = err.to_string();
+    if err_msg.contains("timeout") {
+        return SearchError::Timeout;
+    }
+
+    if err_msg.contains("rate limit") || err_msg.contains("429") {
+        return SearchError::RateLimited;
+    }
+
+    SearchError::Internal(err_msg)
 }
 
 #[cfg(test)]
